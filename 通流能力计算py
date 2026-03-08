@@ -1,0 +1,929 @@
+# -*- coding: utf-8 -*-
+import os, glob, time, math, cmath, traceback, threading, multiprocessing, json, difflib
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import xml.etree.ElementTree as ET
+
+import numpy as np
+from numba import njit
+
+
+warnings_filter = True
+if warnings_filter:
+    import warnings
+    warnings.filterwarnings("ignore")
+
+
+# =============================================================================
+# Part A: 通用工具
+# =============================================================================
+
+def _strip_ns(root):
+    for elem in root.iter():
+        if "}" in elem.tag:
+            elem.tag = elem.tag.split("}", 1)[1]
+
+def _txt_to_arr(text):
+    if not text or not text.strip():
+        return np.array([], dtype=np.float64)
+    return np.array([float(x) for x in text.split()], dtype=np.float64)
+
+def _align_3d_voltage(table_3d, v_axis_src, v_axis_tgt):
+    if table_3d is None or getattr(table_3d, "ndim", 0) != 3:
+        return table_3d
+    vs = np.array(v_axis_src if v_axis_src is not None else [], dtype=np.float64)
+    vt = np.array(v_axis_tgt if v_axis_tgt is not None else [], dtype=np.float64)
+    if vt.size == 0: return table_3d
+    if vs.size == 0: vs = vt.copy()
+    vs = np.abs(vs); vt = np.abs(vt)
+    vs.sort(); vt.sort()
+    Tn, Vn_src, In = table_3d.shape
+    Vn_tgt = vt.size
+    if Vn_src == Vn_tgt: return table_3d
+    if Vn_src == 1: return np.repeat(table_3d, Vn_tgt, axis=1)
+    if Vn_tgt == 1:
+        idx = int(np.argmin(np.abs(vs - vt[0])))
+        return table_3d[:, idx:idx+1, :]
+    out = np.zeros((Tn, Vn_tgt, In), dtype=np.float64)
+    for ti in range(Tn):
+        for ii in range(In):
+            out[ti, :, ii] = np.interp(vt, vs, table_3d[ti, :, ii], left=table_3d[ti, 0, ii], right=table_3d[ti, -1, ii])
+    return out
+
+def _build_diode_from_mos_linear_extrap_first2(i_axis_pos, v_drop_table):
+    i_axis_pos = np.array(i_axis_pos, dtype=np.float64)
+    v_drop_table = np.array(v_drop_table, dtype=np.float64)
+    if i_axis_pos.size < 2 or v_drop_table.ndim != 2 or v_drop_table.shape[1] != i_axis_pos.size:
+        return None, None
+    I1, I2 = float(i_axis_pos[0]), float(i_axis_pos[1])
+    if abs(I2 - I1) < 1e-12: return None, None
+    diode_i = i_axis_pos.copy()
+    Nt, Ni = v_drop_table.shape
+    diode_v = np.zeros((Nt, Ni), dtype=np.float64)
+    for ti in range(Nt):
+        V1, V2 = float(v_drop_table[ti, 0]), float(v_drop_table[ti, 1])
+        a = (V2 - V1) / (I2 - I1)
+        b = V1 - a * I1
+        Vneg = a * (-diode_i) + b
+        diode_v[ti, :] = np.abs(Vneg)
+    return diode_i, diode_v
+
+
+# =============================================================================
+# Part B: XML 读取
+# =============================================================================
+
+def load_data_from_xml(xml_path):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    _strip_ns(root)
+    data = {"IS_MOSFET": False, "HAS_THERMAL": False, "R_TH": None, "FOSTER_R": np.array([], dtype=np.float64), "FOSTER_TAU": np.array([], dtype=np.float64)}
+
+    def parse_energy_table(energy_node, target_scale_base=0.001):
+        xml_scale = float(energy_node.get("scale", 1.0))
+        factor = xml_scale / target_scale_base
+        temps = []
+        for t_node in energy_node.findall(".//Temperature"):
+            v_nodes = t_node.findall("Voltage")
+            rows = []
+            if v_nodes:
+                for v_node in v_nodes: rows.append(_txt_to_arr(v_node.text) * factor)
+            elif t_node.text and t_node.text.strip():
+                rows.append(_txt_to_arr(t_node.text) * factor)
+            temps.append(np.array(rows, dtype=np.float64))
+        return np.array(temps, dtype=np.float64) if temps else None
+
+    for semi in root.findall(".//SemiconductorData"):
+        s_type = (semi.get("type") or "")
+        target_type = None
+        if "MOSFET" in s_type: target_type = "IGBT"; data["IS_MOSFET"] = True
+        elif "IGBT" in s_type: target_type = "IGBT"
+        elif "Diode" in s_type: target_type = "Diode"
+        if target_type is None: continue
+
+        ton_node = semi.find("TurnOnLoss") or semi.find("TurnOn")
+        toff_node = semi.find("TurnOffLoss") or semi.find("TurnOff")
+        cond_node = semi.find("ConductionLoss")
+
+        if ton_node is not None:
+            v_axis = ton_node.find("VoltageAxis"); t_axis = ton_node.find("TemperatureAxis"); i_axis = ton_node.find("CurrentAxis"); e_node = ton_node.find("Energy")
+            if v_axis is not None: data["V_AXIS_SW"] = np.abs(_txt_to_arr(v_axis.text))
+            if t_axis is not None: data["T_AXIS_SW"] = _txt_to_arr(t_axis.text)
+            if target_type == "IGBT" and i_axis is not None: data["IGBT_I_SW"] = _txt_to_arr(i_axis.text)
+            if e_node is not None:
+                arr = parse_energy_table(e_node, target_scale_base=0.001)
+                if arr is not None: data["IGBT_E_ON"] = arr
+
+        if toff_node is not None:
+            v_axis = toff_node.find("VoltageAxis")
+            if ("V_AXIS_SW" not in data) and (v_axis is not None): data["V_AXIS_SW"] = np.abs(_txt_to_arr(v_axis.text))
+            t_axis = toff_node.find("TemperatureAxis")
+            if ("T_AXIS_SW" not in data) and (t_axis is not None): data["T_AXIS_SW"] = _txt_to_arr(t_axis.text)
+            i_axis_off = toff_node.find("CurrentAxis")
+            i_off = _txt_to_arr(i_axis_off.text) if i_axis_off is not None else np.array([], dtype=np.float64)
+            e_node = toff_node.find("Energy")
+            if e_node is not None:
+                arr = parse_energy_table(e_node, target_scale_base=0.001)
+                if arr is not None:
+                    if target_type == "IGBT":
+                        if "IGBT_I_SW" not in data and i_off.size: data["IGBT_I_SW"] = i_off
+                        data["IGBT_E_OFF"] = arr
+                    else:
+                        data["DIODE_I_SW"] = i_off; data["DIODE_E_RR"] = arr
+
+        if cond_node is not None:
+            t_axis = cond_node.find("TemperatureAxis")
+            if t_axis is not None: data["T_AXIS_COND"] = _txt_to_arr(t_axis.text)
+            i_axis = cond_node.find("CurrentAxis")
+            raw_i = _txt_to_arr(i_axis.text) if i_axis is not None else np.array([], dtype=np.float64)
+            v_drop_node = cond_node.find("VoltageDrop")
+            parent = v_drop_node if v_drop_node is not None else cond_node
+            scale = float(parent.get("scale", 1.0))
+            rows = []
+            for t_node in parent.findall("Temperature"): rows.append(_txt_to_arr(t_node.text) * scale)
+            raw_v = np.array(rows, dtype=np.float64)
+            if target_type == "IGBT":
+                if data.get("IS_MOSFET", False) and np.any(raw_i < 0):
+                    mask_pos = raw_i >= 0; data["IGBT_I_COND"] = raw_i[mask_pos]; data["IGBT_V_DROP"] = raw_v[:, mask_pos]
+                    mask_neg = raw_i <= 0; di = np.abs(raw_i[mask_neg]); dv = np.abs(raw_v[:, mask_neg])
+                    data["DIODE_I_COND"] = di[::-1]; data["DIODE_V_DROP"] = dv[:, ::-1]
+                else:
+                    data["IGBT_I_COND"] = raw_i; data["IGBT_V_DROP"] = raw_v
+                    if data.get("IS_MOSFET", False):
+                        if ("DIODE_I_COND" not in data) and ("DIODE_V_DROP" not in data):
+                            di, dv = _build_diode_from_mos_linear_extrap_first2(raw_i, raw_v)
+                            if di is not None: data["DIODE_I_COND"] = di; data["DIODE_V_DROP"] = dv
+            else:
+                data["DIODE_I_COND"] = raw_i; data["DIODE_V_DROP"] = raw_v
+
+    thermal = root.find(".//ThermalModel")
+    if thermal is not None:
+        branch = thermal.find(".//Branch")
+        if branch is not None:
+            btype = (branch.get("type") or "").lower()
+            if ("foster" in btype) or (btype == ""):
+                r_list, tau_list = [], []
+                for el in branch.findall(".//RTauElement"):
+                    try: r_list.append(float(el.get("R"))); tau_list.append(float(el.get("Tau")))
+                    except: pass
+                if r_list:
+                    data["FOSTER_R"] = np.array(r_list, dtype=np.float64); data["FOSTER_TAU"] = np.array(tau_list, dtype=np.float64)
+                    data["R_TH"] = float(np.sum(data["FOSTER_R"])); data["HAS_THERMAL"] = True
+    return data
+
+
+# =============================================================================
+# Part C: Numba 内核
+# =============================================================================
+
+@njit(cache=False, fastmath=False)
+def _idx_for_extrap(axis, x):
+    n = len(axis)
+    if n < 2: return 0
+    i = np.searchsorted(axis, x) - 1
+    if i < 0: i = 0
+    if i > n - 2: i = n - 2
+    return i
+
+@njit(cache=False, fastmath=False)
+def lookup_2d_extrap(x, y, x_axis, y_axis, table):
+    ix = _idx_for_extrap(x_axis, x); iy = _idx_for_extrap(y_axis, y)
+    x1, x2 = x_axis[ix], x_axis[ix+1]; y1, y2 = y_axis[iy], y_axis[iy+1]
+    Q11, Q21 = table[iy, ix], table[iy, ix+1]; Q12, Q22 = table[iy+1, ix], table[iy+1, ix+1]
+    dx = x2 - x1; fx = 0.0 if dx == 0.0 else (x - x1) / dx
+    R1 = Q11 * (1.0 - fx) + Q21 * fx; R2 = Q12 * (1.0 - fx) + Q22 * fx
+    dy = y2 - y1; fy = 0.0 if dy == 0.0 else (y - y1) / dy
+    return R1 * (1.0 - fy) + R2 * fy
+
+@njit(cache=False, fastmath=False)
+def lookup_3d_extrap(i, t, v, i_axis, t_axis, v_axis, table3d):
+    if len(v_axis) < 2: iv0 = 0; fv = 0.0
+    else:
+        iv0 = _idx_for_extrap(v_axis, v); v1, v2 = v_axis[iv0], v_axis[iv0+1]
+        dv = v2 - v1; fv = 0.0 if dv == 0.0 else (v - v1) / dv
+    if len(t_axis) < 2: it0 = 0; ft = 0.0
+    else:
+        it0 = _idx_for_extrap(t_axis, t); t1, t2 = t_axis[it0], t_axis[it0+1]
+        dt = t2 - t1; ft = 0.0 if dt == 0.0 else (t - t1) / dt
+    if len(i_axis) < 2: ii0 = 0; fi = 0.0
+    else:
+        ii0 = _idx_for_extrap(i_axis, i); i1, i2 = i_axis[ii0], i_axis[ii0+1]
+        di = i2 - i1; fi = 0.0 if di == 0.0 else (i - i1) / di
+    v_tl_vl_il, v_tl_vl_ih = table3d[it0, iv0, ii0], table3d[it0, iv0, ii0+1]
+    v_tl_vh_il, v_tl_vh_ih = table3d[it0, iv0+1, ii0], table3d[it0, iv0+1, ii0+1]
+    v_th_vl_il, v_th_vl_ih = table3d[it0+1, iv0, ii0], table3d[it0+1, iv0, ii0+1]
+    v_th_vh_il, v_th_vh_ih = table3d[it0+1, iv0+1, ii0], table3d[it0+1, iv0+1, ii0+1]
+    val_tl_vl = v_tl_vl_il * (1-fi) + v_tl_vl_ih * fi; val_tl_vh = v_tl_vh_il * (1-fi) + v_tl_vh_ih * fi
+    val_th_vl = v_th_vl_il * (1-fi) + v_th_vl_ih * fi; val_th_vh = v_th_vh_il * (1-fi) + v_th_vh_ih * fi
+    val_tl = val_tl_vl * (1-fv) + val_tl_vh * fv; val_th = val_th_vl * (1-fv) + val_th_vh * fv
+    return val_tl * (1-ft) + val_th * ft
+
+MIN_I_SW = 1e-5
+
+@njit(cache=False, fastmath=False)
+def E_on(vdc, i_inst, T, i_axis, t_axis, v_axis, tab):
+    ia = abs(i_inst)
+    if ia < MIN_I_SW: return 0.0
+    return lookup_3d_extrap(ia, T, vdc, i_axis, t_axis, v_axis, tab) * 1e-3
+
+@njit(cache=False, fastmath=False)
+def E_off(vdc, i_inst, T, i_axis, t_axis, v_axis, tab):
+    ia = abs(i_inst)
+    if ia < MIN_I_SW: return 0.0
+    return lookup_3d_extrap(ia, T, vdc, i_axis, t_axis, v_axis, tab) * 1e-3
+
+@njit(cache=False, fastmath=False)
+def E_rr(vdc, i_inst, T, i_axis, t_axis, v_axis, tab):
+    ia = abs(i_inst)
+    if ia < MIN_I_SW: return 0.0
+    return lookup_3d_extrap(ia, T, vdc, i_axis, t_axis, v_axis, tab) * 1e-3
+
+@njit(cache=False, fastmath=False)
+def V_igbt(i_inst, T, i_axis, t_axis, tab2d):
+    ia = abs(i_inst)
+    if ia < 1e-9: return 0.0
+    return lookup_2d_extrap(ia, T, i_axis, t_axis, tab2d)
+
+@njit(cache=False, fastmath=False)
+def V_diode(i_inst, T, i_axis, t_axis, tab2d):
+    ia = abs(i_inst)
+    if ia < 1e-9: return 0.0
+    return lookup_2d_extrap(ia, T, i_axis, t_axis, tab2d)
+
+@njit(cache=False, fastmath=False)
+def svpwm_cmp(Valpha, Vbeta, Vdc, Ts):
+    PI = 3.141592653589793
+    Vm = math.sqrt(Valpha*Valpha + Vbeta*Vbeta); ang = math.atan2(Vbeta, Valpha)
+    if ang < 0: ang += 2*PI
+    sec = int(ang / (PI/3))
+    if sec > 5: sec = 5
+    th = ang - sec*(PI/3); K = Vm * Ts / (math.sqrt(3)/2) / (2*Vdc/3)
+    if sec % 2 != 0: T1, T2 = K * math.sin(th), K * math.sin(PI/3 - th)
+    else: T1, T2 = K * math.sin(PI/3 - th), K * math.sin(th)
+    if T1 + T2 > Ts: r = Ts / (T1 + T2); T1 *= r; T2 *= r
+    T0 = Ts - T1 - T2; cmpa=cmpb=cmpc=0.0
+    if sec == 0: cmpa, cmpb, cmpc = T0/4, T0/4+T1/2, T0/4+T1/2+T2/2
+    elif sec == 1: cmpb, cmpa, cmpc = T0/4, T0/4+T1/2, T0/4+T1/2+T2/2
+    elif sec == 2: cmpb, cmpc, cmpa = T0/4, T0/4+T1/2, T0/4+T1/2+T2/2
+    elif sec == 3: cmpc, cmpb, cmpa = T0/4, T0/4+T1/2, T0/4+T1/2+T2/2
+    elif sec == 4: cmpc, cmpa, cmpb = T0/4, T0/4+T1/2, T0/4+T1/2+T2/2
+    else: cmpa, cmpc, cmpb = T0/4, T0/4+T1/2, T0/4+T1/2+T2/2
+    return cmpa, cmpb, cmpc
+
+@njit(cache=False, fastmath=False)
+def simulation_kernel_stateful_transient(
+        t_start, ia0, ib0, ic0,
+        run_cycles, dt, T_fund, w, V_phase_pk, Vdc, Ts, fsw,
+        E_mag, E_ang, R_load, L_load,
+        T_lookup_igbt, T_lookup_diode,
+        T_coolant,
+        p_avg_init_igbt, p_avg_init_diode,
+        ANALYZE_LAST_N_CYCLES, target_device_idx,
+        calc_rms_flag,
+        V_AXIS_SW, T_AXIS_SW, T_AXIS_COND,
+        I_SW_MOS, TAB_EON, TAB_EOFF, I_COND_MOS, TAB_VDROP,
+        I_SW_DIODE, TAB_ERR, I_COND_DIODE, TAB_VDIODE,
+        F_R_IGBT, F_TAU_IGBT, F_R_DIODE, F_TAU_DIODE,
+        is_mosfet_flag
+):
+    PI = 3.141592653589793; steps = int(run_cycles * T_fund / dt)
+    nI = len(F_R_IGBT); thI, aI, gI = np.zeros(nI), np.zeros(nI), np.zeros(nI)
+    for k in range(nI):
+        tau = F_TAU_IGBT[k]; a = math.exp(-dt/tau) if tau > 1e-12 else 0.0
+        aI[k], gI[k], thI[k] = a, F_R_IGBT[k]*(1.0-a), p_avg_init_igbt*F_R_IGBT[k]
+    nD = len(F_R_DIODE); thD, aD, gD = np.zeros(nD), np.zeros(nD), np.zeros(nD)
+    for k in range(nD):
+        tau = F_TAU_DIODE[k]; a = math.exp(-dt/tau) if tau > 1e-12 else 0.0
+        aD[k], gD[k], thD[k] = a, F_R_DIODE[k]*(1.0-a), p_avg_init_diode*F_R_DIODE[k]
+    acc_on=acc_off=acc_rr=acc_ci=acc_cd=acc_in=acc_i2=acc_v2=0.0; n_samp=0
+    tjI_max, tjD_max, tjI_sum, tjD_sum = -1e9, -1e9, 0.0, 0.0; tj_cnt = 0
+    ia, ib, ic = ia0, ib0, ic0; state_a_prev = 0; pwm_idx = -1; da=db=dc=0.0; Valpha=Vbeta=0.0
+    run_dur = run_cycles * T_fund; stat_start = max(0.0, run_dur - (ANALYZE_LAST_N_CYCLES * T_fund))
+    pwm_phase_offset = w * (Ts/2.0)
+    for k in range(steps):
+        t_rel = k * dt; t_abs = t_start + t_rel; now_idx = int(t_abs * fsw)
+        if now_idx > pwm_idx:
+            th = w*t_abs + pwm_phase_offset; Valpha, Vbeta = V_phase_pk*math.cos(th), V_phase_pk*math.sin(th)
+            ca, cb, cc = svpwm_cmp(Valpha, Vbeta, Vdc, Ts)
+            da, db, dc = 1.0-2.0*ca/Ts, 1.0-2.0*cb/Ts, 1.0-2.0*cc/Ts; pwm_idx = now_idx
+        t_mod = t_abs % Ts; carrier = (t_mod/(Ts/2.0)) if (t_mod < Ts/2.0) else (2.0 - t_mod/(Ts/2.0))
+        sa, sb, sc = (1 if da >= carrier else 0), (1 if db >= carrier else 0), (1 if dc >= carrier else 0)
+        pI, pD = 0.0, 0.0
+        if target_device_idx == 0:
+            if sa != state_a_prev:
+                if sa == 1:
+                    if ia < 0:
+                        e = E_off(Vdc, ia, T_lookup_igbt, I_SW_MOS, T_AXIS_SW, V_AXIS_SW, TAB_EOFF)
+                        if t_rel >= stat_start: acc_off += e
+                        pI += e/dt
+                    else:
+                        e = E_rr(Vdc, ia, T_lookup_diode, I_SW_DIODE, T_AXIS_SW, V_AXIS_SW, TAB_ERR)
+                        if t_rel >= stat_start: acc_rr += e
+                        pD += e/dt
+                else:
+                    if ia < 0:
+                        e = E_on(Vdc, ia, T_lookup_igbt, I_SW_MOS, T_AXIS_SW, V_AXIS_SW, TAB_EON)
+                        if t_rel >= stat_start: acc_on += e
+                        pI += e/dt
+            if sa == 0:
+                if ia < 0:
+                    vd = V_igbt(ia, T_lookup_igbt, I_COND_MOS, T_AXIS_COND, TAB_VDROP)
+                    pc = vd*abs(ia)
+                    if t_rel >= stat_start: acc_ci += pc*dt
+                    pI += pc
+                else:
+                    vf = V_diode(ia, T_lookup_diode, I_COND_DIODE, T_AXIS_COND, TAB_VDIODE)
+                    pc = vf*abs(ia)
+                    if t_rel >= stat_start: acc_cd += pc*dt
+                    pD += pc
+        else:
+            if sa != state_a_prev:
+                if sa == 0:
+                    if ia > 0:
+                        e = E_off(Vdc, ia, T_lookup_igbt, I_SW_MOS, T_AXIS_SW, V_AXIS_SW, TAB_EOFF)
+                        if t_rel >= stat_start: acc_off += e
+                        pI += e/dt
+                    else:
+                        e = E_rr(Vdc, ia, T_lookup_diode, I_SW_DIODE, T_AXIS_SW, V_AXIS_SW, TAB_ERR)
+                        if t_rel >= stat_start: acc_rr += e
+                        pD += e/dt
+                else:
+                    if ia > 0:
+                        e = E_on(Vdc, ia, T_lookup_igbt, I_SW_MOS, T_AXIS_SW, V_AXIS_SW, TAB_EON)
+                        if t_rel >= stat_start: acc_on += e
+                        pI += e/dt
+            if sa == 1:
+                if ia > 0:
+                    vd = V_igbt(ia, T_lookup_igbt, I_COND_MOS, T_AXIS_COND, TAB_VDROP)
+                    pc = vd*abs(ia)
+                    if t_rel >= stat_start: acc_ci += pc*dt
+                    pI += pc
+                else:
+                    vf = V_diode(ia, T_lookup_diode, I_COND_DIODE, T_AXIS_COND, TAB_VDIODE)
+                    pc = vf*abs(ia)
+                    if t_rel >= stat_start: acc_cd += pc*dt
+                    pD += pc
+        if is_mosfet_flag > 0:
+            pT, rise = pI + pD, 0.0
+            for j in range(nI): thI[j] = thI[j]*aI[j] + pT*gI[j]; rise += thI[j]
+            tjI = T_coolant + rise; tjD = tjI
+        else:
+            riseI, riseD = 0.0, 0.0
+            for j in range(nI): thI[j] = thI[j]*aI[j] + pI*gI[j]; riseI += thI[j]
+            for j in range(nD): thD[j] = thD[j]*aD[j] + pD*gD[j]; riseD += thD[j]
+            tjI, tjD = T_coolant+riseI, T_coolant+riseD
+        if t_rel >= stat_start:
+            if tjI > tjI_max: tjI_max = tjI
+            if tjD > tjD_max: tjD_max = tjD
+            tjI_sum, tjD_sum, tj_cnt = tjI_sum+tjI, tjD_sum+tjD, tj_cnt+1
+            idc = (ia if sa==1 else 0.0) + (ib if sb==1 else 0.0) + (ic if sc==1 else 0.0)
+            acc_in += (Vdc * idc) * dt
+            if calc_rms_flag > 0:
+                acc_i2 += (ia*ia + ib*ib + ic*ic)
+                vref_a, vref_b, vref_c = Valpha, -0.5*Valpha+0.866*Vbeta, -0.5*Valpha-0.866*Vbeta
+                acc_v2 += ((vref_a-vref_b)**2 + (vref_b-vref_c)**2 + (vref_c-vref_a)**2); n_samp += 1
+        state_a_prev = sa; va, vb, vc = (Vdc if sa else 0.0), (Vdc if sb else 0.0), (Vdc if sc else 0.0)
+        vn = (va+vb+vc)/3.0; th_e = w*t_abs + E_ang; ea, eb, ec = E_mag*math.cos(th_e), E_mag*math.cos(th_e-2*PI/3), E_mag*math.cos(th_e+2*PI/3)
+        ia += (va-vn-R_load*ia-ea)/L_load*dt; ib += (vb-vn-R_load*ib-eb)/L_load*dt; ic += (vc-vn-R_load*ic-ec)/L_load*dt
+    tjI_mean, tjD_mean = (tjI_sum/tj_cnt if tj_cnt>0 else T_coolant), (tjD_sum/tj_cnt if tj_cnt>0 else T_coolant)
+    return (acc_on, acc_off, acc_rr, acc_ci, acc_cd, acc_in, acc_i2, acc_v2, n_samp, t_abs, ia, ib, ic, tjI_max, tjD_max, tjI_mean, tjD_mean)
+
+
+# =============================================================================
+# Part D: 单点 Worker
+# =============================================================================
+
+def _assert_xml_ok(name, d):
+    if not d.get("HAS_THERMAL", False): raise RuntimeError(f"{name} XML 没有 Foster ThermalModel。")
+    if d.get("R_TH", None) is None or d["R_TH"] <= 1e-9: raise RuntimeError(f"{name} XML 的 Rth 无效。")
+    if d.get("FOSTER_R", np.array([])).size < 1: raise RuntimeError(f"{name} XML Foster_R 为空。")
+
+def _prepare_luts_from_xml(cfg):
+    xml_igbt, xml_diode = os.path.join(cfg["DIR_XML"], cfg["FILE_XML_IGBT"]), os.path.join(cfg["DIR_XML"], cfg["FILE_XML_DIODE"])
+    vals_igbt = load_data_from_xml(xml_igbt); is_mos = bool(vals_igbt.get("IS_MOSFET", False)); _assert_xml_ok("IGBT/MOS", vals_igbt)
+    V_AXIS_SW, T_AXIS_SW, T_AXIS_COND = vals_igbt.get("V_AXIS_SW", np.array([])), vals_igbt.get("T_AXIS_SW", np.array([])), vals_igbt.get("T_AXIS_COND", np.array([]))
+    I_SW_MOS, TAB_EON, TAB_EOFF = vals_igbt.get("IGBT_I_SW", np.array([])), vals_igbt.get("IGBT_E_ON", None), vals_igbt.get("IGBT_E_OFF", None)
+    I_COND_MOS, TAB_VDROP = vals_igbt.get("IGBT_I_COND", np.array([])), vals_igbt.get("IGBT_V_DROP", None)
+    F_R_IGBT, F_TAU_IGBT = vals_igbt["FOSTER_R"], vals_igbt["FOSTER_TAU"]
+    if TAB_EON is not None: TAB_EON = _align_3d_voltage(TAB_EON, vals_igbt.get("V_AXIS_SW", V_AXIS_SW), V_AXIS_SW)
+    if TAB_EOFF is not None: TAB_EOFF = _align_3d_voltage(TAB_EOFF, vals_igbt.get("V_AXIS_SW", V_AXIS_SW), V_AXIS_SW)
+    if is_mos:
+        if ("DIODE_I_COND" not in vals_igbt) or ("DIODE_V_DROP" not in vals_igbt): raise RuntimeError("MOSFET 模式下外推失败。")
+        I_COND_DIODE, TAB_VDIODE = vals_igbt["DIODE_I_COND"], vals_igbt["DIODE_V_DROP"]
+        I_SW_DIODE, TAB_ERR, F_R_DIODE, F_TAU_DIODE, rth_diode = I_SW_MOS, (np.zeros_like(TAB_EON) if TAB_EON is not None else None), F_R_IGBT, F_TAU_IGBT, vals_igbt["R_TH"]
+    else:
+        vals_diode = load_data_from_xml(xml_diode); _assert_xml_ok("Diode", vals_diode)
+        I_SW_DIODE, TAB_ERR = vals_diode.get("DIODE_I_SW", np.array([])), vals_diode.get("DIODE_E_RR", None)
+        I_COND_DIODE, TAB_VDIODE = vals_diode.get("DIODE_I_COND", np.array([])), vals_diode.get("DIODE_V_DROP", None)
+        F_R_DIODE, F_TAU_DIODE, rth_diode = vals_diode["FOSTER_R"], vals_diode["FOSTER_TAU"], vals_diode["R_TH"]
+        if TAB_ERR is not None: TAB_ERR = _align_3d_voltage(TAB_ERR, vals_diode.get("V_AXIS_SW", V_AXIS_SW), V_AXIS_SW)
+    cfg["RTH_IGBT"], cfg["RTH_DIODE"] = float(vals_igbt["R_TH"]), float(rth_diode)
+    def _need(name, arr, minlen=2):
+        if arr is None or (isinstance(arr, np.ndarray) and arr.size < minlen): raise RuntimeError(f"{name} 缺失或无效")
+    _need("V_AXIS_SW", V_AXIS_SW, 1); _need("T_AXIS_SW", T_AXIS_SW, 1); _need("T_AXIS_COND", T_AXIS_COND, 1); _need("I_SW_MOS", I_SW_MOS, 2)
+    _need("TAB_EON", TAB_EON, 1); _need("TAB_EOFF", TAB_EOFF, 1); _need("I_COND_MOS", I_COND_MOS, 2); _need("TAB_VDROP", TAB_VDROP, 1)
+    _need("I_COND_DIODE", I_COND_DIODE, 2); _need("TAB_VDIODE", TAB_VDIODE, 1)
+    return (V_AXIS_SW, T_AXIS_SW, T_AXIS_COND, I_SW_MOS, TAB_EON, TAB_EOFF, I_COND_MOS, TAB_VDROP, I_SW_DIODE, TAB_ERR, I_COND_DIODE, TAB_VDIODE, F_R_IGBT, F_TAU_IGBT, F_R_DIODE, F_TAU_DIODE, is_mos)
+
+def worker_single_point(I_rms, cfg, lut_bundle, warm=None, steady_mode=False):
+    (V_AXIS_SW, T_AXIS_SW, T_AXIS_COND, I_SW_MOS, TAB_EON, TAB_EOFF, I_COND_MOS, TAB_VDROP, I_SW_DIODE, TAB_ERR, I_COND_DIODE, TAB_VDIODE, F_R_IGBT, F_TAU_IGBT, F_R_DIODE, F_TAU_DIODE, is_mos) = lut_bundle
+    Vdc, fsw, f_out, pf, m_in = float(cfg["VDC"]), float(cfg["FSW"]), float(cfg["INPUT_FREQ"]), float(cfg["INPUT_PF"]), float(cfg["INPUT_M"])
+    w = 2 * np.pi * f_out if f_out > 1e-6 else 0.0
+    if steady_mode:
+        iters = int(cfg.get("RATING_STEADY_CYCLES", 5)); startup = iters; dt = float(cfg["HI_DT"]); stat = iters; max_inner = 5
+    else:
+        if f_out < cfg["FREQ_THRESHOLD"]: startup, iters, stat, dt = int(cfg["LO_STARTUP"]), int(cfg["LO_ITER"]), int(cfg["LO_STAT"]), float(cfg["LO_DT"])
+        else: startup, iters, stat, dt = int(cfg["HI_STARTUP"]), int(cfg["HI_ITER"]), int(cfg["HI_STAT"]), float(cfg["HI_DT"])
+        max_inner = 20
+    T_fund = 1.0 / f_out if f_out > 1e-6 else 1.0; stat_dur = max(1e-9, stat * T_fund)
+    v_phase_rms = (m_in * Vdc / math.sqrt(2.0)) / math.sqrt(3.0); v_ref_vec_rms = complex(v_phase_rms, 0.0)
+    theta = math.acos(min(max(abs(pf), -1.0), 1.0))
+    i_ref_vec_rms = complex(I_rms * math.cos(theta), -I_rms * math.sin(theta)); z_motor = complex(cfg["MOTOR_R"], w * cfg["MOTOR_L"])
+    e_vec_rms = v_ref_vec_rms - i_ref_vec_rms * z_motor; E_ang, E_mag_pk = cmath.phase(e_vec_rms), abs(e_vec_rms) * math.sqrt(2.0)
+    V_phase_pk_pwm = min(1.15, (m_in * Vdc / math.sqrt(2.0) * math.sqrt(2.0) / Vdc)) * Vdc / math.sqrt(3.0)
+    Tlk_I, Tlk_D = (float(warm.get("Tlk_I", cfg["TC"])) if warm else float(cfg["TC"])), (float(warm.get("Tlk_D", cfg["TC"])) if warm else float(cfg["TC"]))
+    pavg_I_prev, pavg_D_prev = (float(warm.get("pavg_I", 0.0)) if warm else 0.0), (float(warm.get("pavg_D", 0.0)) if warm else 0.0)
+    t_curr, ia, ib, ic = 0.0, 0.0, 0.0, 0.0; is_mos_flag, final = (1 if is_mos else 0), None
+    for it in range(max_inner):
+        cycles = startup if it == 0 else iters
+        p_feed_I, p_feed_D = (pavg_I_prev + pavg_D_prev if is_mos else pavg_I_prev), (0.0 if is_mos else pavg_D_prev)
+        res = simulation_kernel_stateful_transient(t_curr, ia, ib, ic, cycles, dt, T_fund, w, V_phase_pk_pwm, Vdc, 1.0/fsw, fsw, E_mag_pk, E_ang, cfg["MOTOR_R"], cfg["MOTOR_L"], Tlk_I, Tlk_D, cfg["TC"], p_feed_I, p_feed_D, stat, cfg["TARGET_IDX"], 1, V_AXIS_SW, T_AXIS_SW, T_AXIS_COND, I_SW_MOS, TAB_EON, TAB_EOFF, I_COND_MOS, TAB_VDROP, I_SW_DIODE, TAB_ERR, I_COND_DIODE, TAB_VDIODE, F_R_IGBT, F_TAU_IGBT, F_R_DIODE, F_TAU_DIODE, is_mos_flag)
+        (j_on, j_off, j_rr, j_ci, j_cd, j_in, acc_i2, acc_v2, n_samp, t_curr, ia, ib, ic, tjI_max, tjD_max, tjI_mean, tjD_mean) = res
+        p_on, p_off, p_rr, p_ci, p_cd, p_in = j_on/stat_dur, j_off/stat_dur, j_rr/stat_dur, j_ci/stat_dur, j_cd/stat_dur, j_in/stat_dur
+        pavg_I_prev, pavg_D_prev = (p_on + p_off + p_ci), (p_rr + p_cd)
+        new_Tlk_I = (cfg["TC"] + (pavg_I_prev + pavg_D_prev if is_mos else pavg_I_prev) * cfg["RTH_IGBT"] if steady_mode else tjI_mean)
+        new_Tlk_D = (new_Tlk_I if is_mos else (cfg["TC"] + pavg_D_prev * cfg["RTH_DIODE"])) if steady_mode else tjD_mean
+        diff = max(abs(new_Tlk_I - Tlk_I), abs(new_Tlk_D - Tlk_D)); Tlk_I, Tlk_D = new_Tlk_I, new_Tlk_D
+        sim_irms = math.sqrt(acc_i2/(3.0*n_samp)) if n_samp>0 else 0.0
+        sim_vrms = math.sqrt(acc_v2/(3.0*n_samp)) if n_samp>0 else 0.0
+        # ✅ 核心精度修复：稳态模式下返回理论稳态温度给二分法
+        if steady_mode: final = (p_on, p_off, p_rr, p_ci, p_cd, p_in, sim_irms, sim_vrms, tjI_max, tjD_max, new_Tlk_I, new_Tlk_D)
+        else: final = (p_on, p_off, p_rr, p_ci, p_cd, p_in, sim_irms, sim_vrms, tjI_max, tjD_max, tjI_mean, tjD_mean)
+        if diff < 0.05: break
+    
+    # Pack Rth info
+    rth_info = {"Rth_I": cfg.get("RTH_IGBT", 0.0), "Rth_D": cfg.get("RTH_DIODE", 0.0)}
+    return final, {"Tlk_I": Tlk_I, "Tlk_D": Tlk_D, "pavg_I": pavg_I_prev, "pavg_D": pavg_D_prev, "Rth": rth_info}
+
+
+# =============================================================================
+# Part E: 通流能力
+# =============================================================================
+
+def solve_current_for_tj_mean(cfg, lut_bundle, I_low, I_high, T_target, tol_T=0.2, tol_I=0.1, max_iter=25, logger=None):
+    def log(s): (logger(s) if logger else None)
+    method = cfg.get("RATING_METHOD", "Bisection")
+    switch_win = float(cfg.get("RATING_SWITCH_WIN", 10.0))
+    warm = None; best_I, last_res = 0.0, None
+    if method == "Secant":
+        log(f">>> 启动割线法 (Secant)... 目标: {T_target}C")
+        x0, x1 = float(I_low), float(I_high)
+        res0, warm = worker_single_point(x0, cfg, lut_bundle, warm, steady_mode=True)
+        f0 = res0[10] - T_target
+        res1, warm = worker_single_point(x1, cfg, lut_bundle, warm, steady_mode=True)
+        f1 = res1[10] - T_target
+        best_I, last_res = x1, res1
+        for k in range(max_iter):
+            if abs(f1 - f0) < 1e-6: break
+            x_next = max(0.0, min(x1 - f1 * (x1 - x0) / (f1 - f0), 2000.0))
+            is_steady = abs(x_next - x1) > switch_win
+            res_next, warm = worker_single_point(x_next, cfg, lut_bundle, warm, steady_mode=is_steady)
+            f_next = res_next[10] - T_target
+            log(f"[Secant {k+1:02d}] I={x_next:.2f}A, Tj_err={f_next:+.3f}C, Mode={'Steady' if is_steady else 'Transient'}")
+            best_I, last_res = x_next, res_next
+            if abs(f_next) <= tol_T or abs(x_next - x1) <= tol_I: break
+            x0, f0, x1, f1 = x1, f1, x_next, f_next
+    else:
+        log(f">>> 启动二分法 (Bisection)... 目标: {T_target}C")
+        lo, hi = I_low, I_high
+        for k in range(max_iter):
+            mid = 0.5 * (lo + hi)
+            is_steady = (hi - lo) > switch_win
+            resM, warm = worker_single_point(mid, cfg, lut_bundle, warm, steady_mode=is_steady)
+            tjM = resM[10]; err = tjM - T_target
+            log(f"[Bisection {k+1:02d}] I={mid:.2f}A, Tj_err={err:+.3f}C, Mode={'Steady' if is_steady else 'Transient'}")
+            best_I, last_res = mid, resM
+            if abs(err) <= tol_T or (hi - lo) <= tol_I: break
+            if tjM < T_target: lo = mid
+            else: hi = mid
+    log(">>> 切换到最终精细瞬态计算以锁定精度...")
+    # ✅ 核心精度修复：最后一轮增加迭代时长确保热平衡
+    cfg_final = cfg.copy(); cfg_final["HI_ITER"] = max(cfg_final.get("HI_ITER", 50), 100) 
+    final_res, warm_final = worker_single_point(best_I, cfg_final, lut_bundle, warm, steady_mode=False)
+    return (best_I, final_res, warm_final)
+
+
+# =============================================================================
+# Part F: 业务逻辑
+# =============================================================================
+
+def run_single_point_logic(cfg, logger):
+    logger("="*60 + "\n单点计算 (Foster瞬态热 + 查表线性外推 + Tj_mean闭环)\n" + "="*60)
+    lut = _prepare_luts_from_xml(cfg); I_in, t0 = float(cfg["INPUT_I_RMS"]), time.time()
+    res, warm = worker_single_point(I_in, cfg, lut, warm=None, steady_mode=False)
+    
+    p_cond = res[3] + res[4]
+    p_sw = res[0] + res[1] + res[2]
+    p_loss = p_cond + p_sw
+    eff = (max(0, abs(res[5])-p_loss*6.0)/abs(res[5])*100.0) if abs(res[5])>1.0 else 0.0
+    rth_i = cfg.get("RTH_IGBT", 0.0)
+    rth_d = cfg.get("RTH_DIODE", 0.0)
+    
+    logger(f"[Result] I_in={I_in:.3f}A, time={time.time()-t0:.2f}s\n"
+           f"  Sim I_rms={res[6]:.3f}A, V_line={res[7]:.3f}V, Pdc={res[5]:.3f}W, Eff={eff:.2f}%\n"
+           f"  Switch: Tj_mean={res[10]:.3f}C, Tj_max={res[8]:.3f}C\n"
+           f"  Loss Detail:\n"
+           f"    P_cond = {p_cond:.3f} W\n"
+           f"    P_sw   = {p_sw:.3f} W  (On={res[0]:.3f}, Off={res[1]:.3f}, Rr={res[2]:.3f})\n"
+           f"    P_total= {p_loss:.3f} W\n"
+           f"    Ratio (Cond/Sw) = {(p_cond/p_sw if p_sw > 1e-6 else 0.0):.3f}\n"
+           f"    Rth    = IGBT {rth_i:.4f}, Diode {rth_d:.4f} K/W\n"
+           + "="*60)
+
+def run_current_rating_logic(cfg, logger):
+    logger("="*60 + "\n通流能力 (支持多点计算)\n" + "="*60)
+    lut = _prepare_luts_from_xml(cfg); t0 = time.time()
+    tasks = cfg.get("RATING_TASKS", [{"T": float(cfg["RATING_TJ_TARGET"]), "L": float(cfg["RATING_I_LOW"]), "H": float(cfg["RATING_I_HIGH"])}])
+    
+    for i, t in enumerate(tasks):
+        T_target, I_L, I_H = float(t["T"]), float(t["L"]), float(t["H"])
+        logger(f"\n>>> 任务 {i+1}/{len(tasks)}: 目标 Tj={T_target}C, 范围 [{I_L}, {I_H}] A")
+        I_star, res, warm = solve_current_for_tj_mean(cfg, lut, I_L, I_H, T_target, float(cfg["RATING_TOL_T"]), float(cfg["RATING_TOL_I"]), int(cfg["RATING_MAX_IT"]), logger=logger)
+        
+        p_cond = res[3] + res[4]
+        p_sw = res[0] + res[1] + res[2]
+        p_loss = p_cond + p_sw
+        rth_i = warm.get("Rth", {}).get("Rth_I", 0.0)
+        
+        logger(f"[Rating Result #{i+1}] I_rms = {I_star:.2f} A @ Tj_mean={res[10]:.2f}C (Target {T_target}C)\n"
+               f"  Switch: Tj_max={res[8]:.2f}C, Diode: Tj_max={res[9]:.2f}C, Tj_mean={res[11]:.2f}C\n"
+               f"  Loss: {p_loss:.2f}W (Cond={p_cond:.2f}, Sw={p_sw:.2f} -> On={res[0]:.2f}, Off={res[1]:.2f}, Rr={res[2]:.2f})\n"
+               f"  Rth_IGBT: {rth_i:.4f} K/W\n" + "-"*30)
+    logger(f"\n所有任务完成, 总耗时: {time.time()-t0:.2f}s\n" + "="*60)
+
+
+# =============================================================================
+# Part G: GUI
+# =============================================================================
+
+def _batch_worker_process(args):
+    # This function must be at module level for pickle to work with multiprocessing
+    idx, cfg, is_rating = args
+    try:
+        lut = _prepare_luts_from_xml(cfg)
+        if is_rating:
+            tasks = cfg.get("RATING_TASKS", [{"T": 150, "L": 10, "H": 300}])
+            res_list, res_str = [], []
+            for i, t in enumerate(tasks):
+                 I_s, res, _ = solve_current_for_tj_mean(cfg, lut, float(t["L"]), float(t["H"]), float(t["T"]), 0.2, 0.1, 20)
+                 p_cond = res[3] + res[4]
+                 p_sw = res[0] + res[1] + res[2]
+                 p_total = p_cond + p_sw
+                 ratio = p_cond / p_sw if p_sw > 1e-9 else 0.0
+                 res_list.append({
+                     "I": I_s, "T_target": t["T"], "T_act": res[10], 
+                     "Loss": p_total, "P_cond": p_cond, "P_sw": p_sw,
+                     "P_on": res[0], "P_off": res[1], "P_rr": res[2], 
+                     "Ratio": ratio, "Rth_I": cfg.get("RTH_IGBT", 0), "Rth_D": cfg.get("RTH_DIODE", 0)
+                 })
+                 res_str.append(f"{I_s:.1f}A@{t['T']}C")
+            return (idx, True, " | ".join(res_str), {"mode": "rating", "data": res_list}, None)
+        else:
+            I_in = float(cfg["INPUT_I_RMS"]); res, _ = worker_single_point(I_in, cfg, lut, steady_mode=False)
+            loss = (res[0]+res[1]+res[3]) + (res[2]+res[4])
+            p_cond = res[3] + res[4]
+            p_sw = res[0] + res[1] + res[2]
+            ratio = p_cond / p_sw if p_sw > 1e-9 else 0.0
+            final_str = f"Loss={loss:.1f}W, Tj={res[15]:.0f}C"
+            res_data = {
+                "mode": "single", "Loss": loss, "Tj_mean": res[15],
+                "P_cond": p_cond, "P_sw": p_sw, "Ratio": ratio,
+                "P_on": res[0], "P_off": res[1], "P_rr": res[2],
+                "Rth_I": cfg.get("RTH_IGBT", 0), "Rth_D": cfg.get("RTH_DIODE", 0)
+            }
+            return (idx, True, final_str, res_data, None)
+    except Exception as e:
+        return (idx, False, "", {}, str(e))
+
+class BatchDialog:
+    def __init__(self, parent, base_cfg, var_cpu):
+        self.top = tk.Toplevel(parent); self.top.title("批量计算模式"); self.top.geometry("960x600")
+        self.base_cfg = base_cfg
+        self.var_cpu = var_cpu # Keep Tk var separate
+        self.pairs = []
+        self._build_ui()
+
+    def _build_ui(self):
+        frm_top = ttk.Frame(self.top, padding=10); frm_top.pack(fill=tk.X)
+        ttk.Label(frm_top, text="XML目录:").pack(side=tk.LEFT)
+        self.var_dir = tk.StringVar(value=self.base_cfg["DIR_XML"])
+        ttk.Entry(frm_top, textvariable=self.var_dir, width=40).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frm_top, text="扫描并自动匹配", command=self._scan).pack(side=tk.LEFT, padx=5)
+        ttk.Label(frm_top, text="  模式:").pack(side=tk.LEFT)
+        self.var_mode = tk.StringVar(value="Rating (通流能力)")
+        ttk.Combobox(frm_top, textvariable=self.var_mode, values=["Rating (通流能力)", "Single (单点损耗)"], state="readonly", width=18).pack(side=tk.LEFT, padx=5)
+        
+        self.tree = ttk.Treeview(self.top, columns=("name", "type", "igbt", "diode", "status", "result"), show="headings")
+        for c, w, t in [("name", 150, "标识名"), ("type", 80, "类型"), ("igbt", 200, "Switch XML"), ("diode", 200, "Diode XML"), ("status", 80, "状态"), ("result", 200, "结果")]:
+            self.tree.heading(c, text=t); self.tree.column(c, width=w)
+        ysb = ttk.Scrollbar(self.top, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscroll=ysb.set); self.tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        frm_bot = ttk.Frame(self.top, padding=10); frm_bot.pack(fill=tk.X)
+        self.pbar = ttk.Progressbar(frm_bot, orient=tk.HORIZONTAL, mode='determinate'); self.pbar.pack(side=tk.TOP, fill=tk.X, pady=5)
+        
+        frm_ctrl = ttk.Frame(frm_bot); frm_ctrl.pack(side=tk.RIGHT)
+        ttk.Label(frm_ctrl, text="并行核数:").pack(side=tk.LEFT)
+        ttk.Entry(frm_ctrl, textvariable=self.var_cpu, width=4).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frm_ctrl, text="开始批量计算", command=self._start_run).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frm_ctrl, text="导出 CSV", command=self._export_csv).pack(side=tk.LEFT, padx=5)
+        
+        self.lbl_status = ttk.Label(frm_bot, text="Ready"); self.lbl_status.pack(side=tk.LEFT)
+
+    def _scan(self):
+        d = self.var_dir.get()
+        if not os.path.isdir(d): return messagebox.showerror("错误", "目录不存在")
+        for i in self.tree.get_children(): self.tree.delete(i)
+        self.pairs = []
+        files = glob.glob(os.path.join(d, "*.xml"))
+        mos, igbts, diodes = [], [], []
+        
+        for f in files:
+            try:
+                data = load_data_from_xml(f); t = "Unknown"
+                if data.get("IS_MOSFET"): t = "MOS"
+                else:
+                    is_igbt = ("IGBT_I_SW" in data or "IGBT_E_ON" in data)
+                    is_diode = ("DIODE_E_RR" in data or "DIODE_I_SW" in data or "DIODE_V_DROP" in data)
+                    if is_igbt: t = "IGBT"
+                    elif is_diode: t = "Diode"
+                if t == "MOS": mos.append(f)
+                elif t == "IGBT": igbts.append(f)
+                elif t == "Diode": diodes.append(f)
+            except: pass
+            
+        for m in mos:
+            nm = os.path.basename(m); self.pairs.append({"type": "MOS", "igbt": m, "diode": None, "name": nm})
+            self.tree.insert("", "end", values=(nm, "MOS", nm, "-", "Ready", ""))
+            
+        for i_f in igbts:
+            i_name = os.path.basename(i_f); i_core = os.path.splitext(i_name.lower().replace("igbt", ""))[0]
+            best_d, best_score = None, 0.0
+            for d_f in diodes:
+                d_name = os.path.basename(d_f); d_core = os.path.splitext(d_name.lower().replace("diode", ""))[0]
+                if i_core == d_core: best_d, best_score = d_f, 1.0; break
+                r = difflib.SequenceMatcher(None, i_core, d_core).ratio()
+                if r > best_score: best_score, best_d = r, d_f
+            if best_score < 0.3: best_d = (diodes[0] if len(diodes)==1 else None)
+            d_nm = (os.path.basename(best_d) if best_d else "MISSING")
+            self.pairs.append({"type": "IGBT+Diode", "igbt": i_f, "diode": best_d, "name": i_name})
+            self.tree.insert("", "end", values=(i_name, "IGBT+Diode", i_name, d_nm, "Ready", ""))
+
+    def _start_run(self):
+        if not self.pairs: return
+        is_rating = "Rating" in self.var_mode.get()
+        items = self.tree.get_children(); self.pbar["maximum"] = len(items); self.pbar["value"] = 0
+        
+        tasks = []
+        for idx, item_id in enumerate(items):
+            p = self.pairs[idx]
+            if not p["igbt"] or (p["type"] == "IGBT+Diode" and not p["diode"]):
+                self.tree.set(item_id, "status", "Skip"); continue
+            self.tree.set(item_id, "status", "Pending...")
+            
+            # Create a clean config copy without Tkinter variables
+            # self.base_cfg contains raw values now because we updated _start_run to use clean values, 
+            # BUT we need to ensure no other Tk objects are sneaking in.
+            # _cfg() method returns dict of values (int/float/str), but let's be sure.
+            
+            # Re-read fresh config from GUI to ensure latest values
+            # (Warning: _cfg() reads from self.var_*, which are TkVars. The result is pure python types)
+            # BatchDialog doesn't have _cfg(), use self.base_cfg directly but we must copy it to avoid issues
+            # We already passed clean_cfg to BatchDialog, so self.base_cfg IS clean (no Tk vars).
+            # But we need to make sure we don't accidentally modify the shared reference for subsequent tasks if we edit it.
+            raw_cfg = self.base_cfg.copy()
+            
+            # Inject file paths
+            raw_cfg["DIR_XML"] = os.path.dirname(p["igbt"])
+            raw_cfg["FILE_XML_IGBT"] = os.path.basename(p["igbt"])
+            if p["diode"]: raw_cfg["FILE_XML_DIODE"] = os.path.basename(p["diode"])
+            
+            tasks.append((idx, raw_cfg, is_rating))
+
+        if not tasks: return
+
+        # Capture pool params here to avoid pickling 'self' or GUI elements
+        pool_processes = self.var_cpu.get()
+
+        def _run_pool():
+            t0 = time.time()
+            self.top.after(0, lambda: self.lbl_status.configure(text=f"Running with {pool_processes} cores..."))
+            try:
+                # Use 'fork' context on Linux/Mac if needed, but 'spawn' is default/safe on Windows.
+                # Standard Pool uses default context.
+                with multiprocessing.Pool(processes=pool_processes) as pool:
+                    for res in pool.imap_unordered(_batch_worker_process, tasks):
+                        idx, success, res_str, res_data, err_msg = res
+                        item_id = items[idx]
+                        if success:
+                            # We can't update self.pairs directly in the thread safely if we were strictly checking thread safety,
+                            # but in Python lists/dicts are atomic enough for this assignment or we should use top.after.
+                            # Better: update data in main thread callback.
+                            self.top.after(0, lambda id=item_id, idx=idx, d=res_data, s=res_str: (self.pairs[idx].update({"res": d}), self.tree.set(id, "result", s), self.tree.set(id, "status", "Done")))
+                        else:
+                            self.top.after(0, lambda id=item_id, e=err_msg: (self.tree.set(id, "status", "Error"), self.tree.set(id, "result", e)))
+                        self.top.after(0, lambda: self.pbar.step())
+                dt = time.time() - t0
+                self.top.after(0, lambda: (messagebox.showinfo("完成", f"批量计算结束\n耗时: {dt:.2f}s"), self.lbl_status.configure(text=f"Done in {dt:.2f}s")))
+            except Exception as e:
+                # Capture exception string to pass to GUI thread
+                err_s = str(e)
+                self.top.after(0, lambda: (messagebox.showerror("错误", f"并行池错误: {err_s}"), self.lbl_status.configure(text="Error")))
+
+        threading.Thread(target=_run_pool, daemon=True).start()
+
+    def _export_csv(self):
+        p = filedialog.asksaveasfilename(defaultextension=".csv")
+        if p:
+            import csv
+            with open(p, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                # Flat structure: One row per rating point
+                base_h = ["Name", "Type", "Switch", "Diode", "Rth_IGBT", "Rth_Diode", "Mode", "Target_Tj", "Result_I_rms", "Result_Tj_Mean", "Total_Loss", "Cond_Loss", "Sw_Loss", "Ratio_Cond/Sw", "P_on", "P_off", "P_rr"]
+                w.writerow(base_h)
+                
+                for px in self.pairs:
+                    r = px.get("res", {})
+                    common = [px["name"], px["type"], os.path.basename(px["igbt"]), (os.path.basename(px["diode"]) if px["diode"] else "")]
+                    
+                    if r.get("mode") == "rating":
+                        data = r.get("data", [])
+                        for item in data:
+                            # Add thermal resistance if available, else 0
+                            rth_i = item.get("Rth_I", 0); rth_d = item.get("Rth_D", 0)
+                            row = common + [f"{rth_i:.4f}", f"{rth_d:.4f}", "Rating", item["T_target"], f"{item['I']:.2f}", f"{item['T_act']:.2f}", 
+                                           f"{item['Loss']:.2f}", f"{item['P_cond']:.2f}", f"{item['P_sw']:.2f}", f"{item['Ratio']:.2f}",
+                                           f"{item['P_on']:.2f}", f"{item['P_off']:.2f}", f"{item['P_rr']:.2f}"]
+                            w.writerow(row)
+                    elif r.get("mode") == "single":
+                        rth_i = r.get("Rth_I", 0); rth_d = r.get("Rth_D", 0)
+                        w.writerow(common + [f"{rth_i:.4f}", f"{rth_d:.4f}", "Single", "-", self.base_cfg["INPUT_I_RMS"], f"{r.get('Tj_mean', 0):.2f}", 
+                                           f"{r.get('Loss', 0):.2f}", f"{r.get('P_cond', 0):.2f}", f"{r.get('P_sw', 0):.2f}", f"{r.get('Ratio', 0):.2f}",
+                                           f"{r.get('P_on', 0):.2f}", f"{r.get('P_off', 0):.2f}", f"{r.get('P_rr', 0):.2f}"])
+            messagebox.showinfo("成功", "导出成功")
+
+class App:
+    def __init__(self, root):
+        self.root = root; self.root.title("HPD 单点通流能力 (精度优化版)"); self.root.geometry("720x920")
+        self.var_xml_dir, self.var_xml_igbt, self.var_xml_diode = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.var_vdc, self.var_tc, self.var_fsw, self.var_motor_r, self.var_motor_l, self.var_target = tk.DoubleVar(value=630.0), tk.DoubleVar(value=65.0), tk.DoubleVar(value=10000.0), tk.DoubleVar(value=20e-3), tk.DoubleVar(value=0.5e-3), tk.StringVar(value="Bottom (下管)")
+        self.var_input_current, self.var_input_m, self.var_input_pf, self.var_input_freq = tk.DoubleVar(value=100.0), tk.DoubleVar(value=0.8), tk.DoubleVar(value=0.95), tk.DoubleVar(value=50.0)
+        self.var_freq_threshold, self.var_hi_dt, self.var_hi_startup, self.var_hi_iter, self.var_hi_stat = tk.DoubleVar(value=150.0), tk.DoubleVar(value=1e-8), tk.IntVar(value=100), tk.IntVar(value=50), tk.IntVar(value=24)
+        self.var_lo_dt, self.var_lo_startup, self.var_lo_iter, self.var_lo_stat = tk.DoubleVar(value=1e-8), tk.IntVar(value=20), tk.IntVar(value=10), tk.IntVar(value=6)
+        self.var_tj_target, self.var_i_low, self.var_i_high, self.var_tol_t, self.var_tol_i, self.var_max_it = tk.DoubleVar(value=150.0), tk.DoubleVar(value=10.0), tk.DoubleVar(value=300.0), tk.DoubleVar(value=0.2), tk.DoubleVar(value=0.1), tk.IntVar(value=25)
+        self.var_en_pt2, self.var_tj_2, self.var_il_2, self.var_ih_2 = tk.BooleanVar(value=False), tk.DoubleVar(value=125.0), tk.DoubleVar(value=10.0), tk.DoubleVar(value=300.0)
+        self.var_en_pt3, self.var_tj_3, self.var_il_3, self.var_ih_3 = tk.BooleanVar(value=False), tk.DoubleVar(value=100.0), tk.DoubleVar(value=10.0), tk.DoubleVar(value=300.0)
+        self.var_steady_cycles, self.var_switch_win = tk.IntVar(value=5), tk.DoubleVar(value=10.0)
+        import multiprocessing
+        self.var_cpu_cores = tk.IntVar(value=max(1, multiprocessing.cpu_count() - 2))
+        self.var_rating_method = tk.StringVar(value="Bisection")
+        self._build()
+
+    def _build(self):
+        paned = ttk.PanedWindow(self.root, orient=tk.VERTICAL); paned.pack(fill=tk.BOTH, expand=True)
+        top = ttk.Frame(paned); paned.add(top, weight=3); canvas = tk.Canvas(top); sb = ttk.Scrollbar(top, orient="vertical", command=canvas.yview); frm = ttk.Frame(canvas)
+        frm.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))); canvas.create_window((0,0), window=frm, anchor="nw"); canvas.configure(yscrollcommand=sb.set); canvas.pack(side="left", fill="both", expand=True); sb.pack(side="right", fill="y")
+        bottom = ttk.LabelFrame(paned, text="日志", padding=5); paned.add(bottom, weight=2); self.log = scrolledtext.ScrolledText(bottom, state="disabled", height=18, font=("Consolas", 10)); self.log.pack(fill=tk.BOTH, expand=True)
+        pad = {"padx":10, "pady":6}
+        g = ttk.LabelFrame(frm, text="XML 模型", padding=10); g.pack(fill=tk.X, **pad); ttk.Entry(g, textvariable=self.var_xml_dir, width=56).grid(row=0, column=0, padx=5); ttk.Button(g, text="选择目录...", command=self._pick_xml_dir).grid(row=0, column=1); ttk.Label(g, text="Switch XML:").grid(row=1, column=0, sticky="w"); self.cb_igbt = ttk.Combobox(g, textvariable=self.var_xml_igbt, width=53); self.cb_igbt.grid(row=2, column=0, padx=5, sticky="w"); ttk.Label(g, text="Diode XML:").grid(row=3, column=0, sticky="w"); self.cb_diode = ttk.Combobox(g, textvariable=self.var_xml_diode, width=53); self.cb_diode.grid(row=4, column=0, padx=5, sticky="w")
+        g2 = ttk.LabelFrame(frm, text="单点工况输入", padding=10); g2.pack(fill=tk.X, **pad)
+        def row(r, name, var, unit): ttk.Label(g2, text=name, font=("Arial", 10, "bold")).grid(row=r, column=0, sticky="e", pady=2); ttk.Entry(g2, textvariable=var, width=14).grid(row=r, column=1, padx=10); ttk.Label(g2, text=unit).grid(row=r, column=2, sticky="w")
+        row(0, "相电流 I_rms:", self.var_input_current, "A"); row(1, "调制比 m:", self.var_input_m, "0~1.15"); row(2, "功率因数 PF:", self.var_input_pf, "-1~1"); row(3, "输出频率 Fout:", self.var_input_freq, "Hz")
+        g3 = ttk.LabelFrame(frm, text="物理/环境", padding=10); g3.pack(fill=tk.X, **pad)
+        ttk.Label(g3, text="Vdc (V):").grid(row=0, column=0); ttk.Entry(g3, textvariable=self.var_vdc, width=10).grid(row=0, column=1); ttk.Label(g3, text="Tc (C):").grid(row=0, column=2); ttk.Entry(g3, textvariable=self.var_tc, width=10).grid(row=0, column=3)
+        ttk.Label(g3, text="Fsw (Hz):").grid(row=1, column=0); ttk.Entry(g3, textvariable=self.var_fsw, width=10).grid(row=1, column=1); ttk.Label(g3, text="监测:").grid(row=1, column=2); ttk.Combobox(g3, textvariable=self.var_target, values=["Bottom (下管)", "Top (上管)"], state="readonly", width=10).grid(row=1, column=3)
+        g5 = ttk.LabelFrame(frm, text="通流能力 (支持多点)", padding=10); g5.pack(fill=tk.X, **pad)
+        
+        # Header
+        ttk.Label(g5, text="启用", font=("Arial", 9, "bold")).grid(row=0, column=0)
+        ttk.Label(g5, text="目标Tj (C)", font=("Arial", 9, "bold")).grid(row=0, column=1)
+        ttk.Label(g5, text="I_low (A)", font=("Arial", 9, "bold")).grid(row=0, column=2)
+        ttk.Label(g5, text="I_high (A)", font=("Arial", 9, "bold")).grid(row=0, column=3)
+        
+        # Point 1 (Always enabled)
+        ttk.Label(g5, text="Point 1").grid(row=1, column=0)
+        ttk.Entry(g5, textvariable=self.var_tj_target, width=10).grid(row=1, column=1, padx=2, pady=2)
+        ttk.Entry(g5, textvariable=self.var_i_low, width=10).grid(row=1, column=2, padx=2, pady=2)
+        ttk.Entry(g5, textvariable=self.var_i_high, width=10).grid(row=1, column=3, padx=2, pady=2)
+        
+        # Point 2
+        ttk.Checkbutton(g5, variable=self.var_en_pt2, text="Pt 2").grid(row=2, column=0)
+        e2a = ttk.Entry(g5, textvariable=self.var_tj_2, width=10); e2a.grid(row=2, column=1, padx=2, pady=2)
+        e2b = ttk.Entry(g5, textvariable=self.var_il_2, width=10); e2b.grid(row=2, column=2, padx=2, pady=2)
+        e2c = ttk.Entry(g5, textvariable=self.var_ih_2, width=10); e2c.grid(row=2, column=3, padx=2, pady=2)
+        
+        # Point 3
+        ttk.Checkbutton(g5, variable=self.var_en_pt3, text="Pt 3").grid(row=3, column=0)
+        e3a = ttk.Entry(g5, textvariable=self.var_tj_3, width=10); e3a.grid(row=3, column=1, padx=2, pady=2)
+        e3b = ttk.Entry(g5, textvariable=self.var_il_3, width=10); e3b.grid(row=3, column=2, padx=2, pady=2)
+        e3c = ttk.Entry(g5, textvariable=self.var_ih_3, width=10); e3c.grid(row=3, column=3, padx=2, pady=2)
+
+        # Params
+        f_par = ttk.Frame(g5); f_par.grid(row=4, column=0, columnspan=4, pady=5)
+        ttk.Label(f_par, text="Tol_T:").pack(side=tk.LEFT)
+        ttk.Entry(f_par, textvariable=self.var_tol_t, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_par, text="Tol_I:").pack(side=tk.LEFT, padx=(5,0))
+        ttk.Entry(f_par, textvariable=self.var_tol_i, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_par, text="MaxIt:").pack(side=tk.LEFT, padx=(5,0))
+        ttk.Entry(f_par, textvariable=self.var_max_it, width=4).pack(side=tk.LEFT, padx=2)
+        
+        f_par2 = ttk.Frame(g5); f_par2.grid(row=5, column=0, columnspan=4, pady=2)
+        ttk.Label(f_par2, text="SteadyCyc:").pack(side=tk.LEFT)
+        ttk.Entry(f_par2, textvariable=self.var_steady_cycles, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_par2, text="Win:").pack(side=tk.LEFT, padx=(5,0))
+        ttk.Entry(f_par2, textvariable=self.var_switch_win, width=4).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f_par2, text="Algo:").pack(side=tk.LEFT, padx=(5,0))
+        ttk.Combobox(f_par2, textvariable=self.var_rating_method, values=["Bisection", "Secant"], state="readonly", width=10).pack(side=tk.LEFT, padx=2)
+        
+        bf_cfg = ttk.Frame(frm); bf_cfg.pack(fill=tk.X, padx=10, pady=5); ttk.Button(bf_cfg, text="💾 保存配置", command=self._save_config).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2); ttk.Button(bf_cfg, text="📂 导入配置", command=self._load_config).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        bf = ttk.Frame(frm); bf.pack(fill=tk.X, padx=10, pady=12); style = ttk.Style(); style.configure("Big.TButton", font=("Arial", 12, "bold"), padding=10); self.btn_single = ttk.Button(bf, text="RUN 单点", command=self._run_single, style="Big.TButton"); self.btn_single.pack(fill=tk.X, pady=6); self.btn_rating = ttk.Button(bf, text="RUN 通流能力", command=self._run_rating, style="Big.TButton"); self.btn_rating.pack(fill=tk.X, pady=6); self.btn_batch = ttk.Button(bf, text="RUN 批量模式", command=self._run_batch_dialog, style="Big.TButton"); self.btn_batch.pack(fill=tk.X, pady=6)
+
+    def _save_config(self):
+        data = {k: v.get() for k, v in self.__dict__.items() if isinstance(v, (tk.Variable))}
+        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+        if path:
+            try:
+                with open(path, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4)
+                messagebox.showinfo("成功", "配置已保存")
+            except Exception as e: messagebox.showerror("错误", f"保存失败: {e}")
+
+    def _load_config(self):
+        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
+        if path:
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for k, v in data.items(): (getattr(self, k).set(v) if hasattr(self, k) else None)
+                messagebox.showinfo("成功", "配置已加载")
+            except Exception as e: messagebox.showerror("错误", f"加载失败: {e}")
+
+    def _pick_xml_dir(self):
+        p = filedialog.askdirectory()
+        if p:
+            self.var_xml_dir.set(p); xmls = [os.path.basename(x) for x in glob.glob(os.path.join(p, "*.xml"))]
+            self.cb_igbt["values"] = self.cb_diode["values"] = xmls
+            for f in xmls:
+                fl = f.lower()
+                if ("mos" in fl) or ("igbt" in fl): self.var_xml_igbt.set(f)
+                if ("diode" in fl) or ("body" in fl): self.var_xml_diode.set(f)
+
+    def _cfg(self):
+        pts = [{"T": self.var_tj_target.get(), "L": self.var_i_low.get(), "H": self.var_i_high.get()}]
+        if self.var_en_pt2.get(): pts.append({"T": self.var_tj_2.get(), "L": self.var_il_2.get(), "H": self.var_ih_2.get()})
+        if self.var_en_pt3.get(): pts.append({"T": self.var_tj_3.get(), "L": self.var_il_3.get(), "H": self.var_ih_3.get()})
+        return {
+            "DIR_XML": self.var_xml_dir.get(), "FILE_XML_IGBT": self.var_xml_igbt.get(), "FILE_XML_DIODE": self.var_xml_diode.get(),
+            "INPUT_I_RMS": self.var_input_current.get(), "INPUT_M": self.var_input_m.get(), "INPUT_PF": self.var_input_pf.get(), "INPUT_FREQ": self.var_input_freq.get(),
+            "VDC": self.var_vdc.get(), "TC": self.var_tc.get(), "FSW": self.var_fsw.get(), "MOTOR_R": self.var_motor_r.get(), "MOTOR_L": self.var_motor_l.get(),
+            "TARGET_IDX": (0 if "Bottom" in self.var_target.get() else 1), "FREQ_THRESHOLD": self.var_freq_threshold.get(),
+            "HI_DT": self.var_hi_dt.get(), "HI_STARTUP": self.var_hi_startup.get(), "HI_ITER": self.var_hi_iter.get(), "HI_STAT": self.var_hi_stat.get(),
+            "LO_DT": self.var_lo_dt.get(), "LO_STARTUP": self.var_lo_startup.get(), "LO_ITER": self.var_lo_iter.get(), "LO_STAT": self.var_lo_stat.get(),
+            "RATING_TASKS": pts,
+            "RATING_TJ_TARGET": self.var_tj_target.get(), "RATING_I_LOW": self.var_i_low.get(), "RATING_I_HIGH": self.var_i_high.get(),
+            "RATING_TOL_T": self.var_tol_t.get(), "RATING_TOL_I": self.var_tol_i.get(), "RATING_MAX_IT": self.var_max_it.get(),
+            "RATING_STEADY_CYCLES": self.var_steady_cycles.get(), "RATING_SWITCH_WIN": self.var_switch_win.get(), "RATING_METHOD": self.var_rating_method.get()
+        }
+
+    def _log(self, s): self.log.after(0, lambda: (self.log.configure(state="normal"), self.log.insert(tk.END, str(s)+"\n"), self.log.see(tk.END), self.log.configure(state="disabled")))
+
+    def _run_single(self):
+        if not self.var_xml_dir.get(): return messagebox.showwarning("警告", "请先选择 XML 目录")
+        self.btn_single.config(state="disabled"); self.btn_rating.config(state="disabled"); self.log.configure(state="normal"); self.log.delete(1.0, tk.END); self.log.configure(state="disabled")
+        def _target():
+            try: run_single_point_logic(self._cfg(), self._log)
+            except Exception as e: self._log(f"!!! ERROR: {e}\n{traceback.format_exc()}")
+            finally: self.btn_single.config(state="normal"); self.btn_rating.config(state="normal")
+        threading.Thread(target=_target, daemon=True).start()
+
+    def _run_rating(self):
+        if not self.var_xml_dir.get(): return messagebox.showwarning("警告", "请先选择 XML 目录")
+        self.btn_single.config(state="disabled"); self.btn_rating.config(state="disabled"); self.log.configure(state="normal"); self.log.delete(1.0, tk.END); self.log.configure(state="disabled")
+        def _target():
+            try: run_current_rating_logic(self._cfg(), self._log)
+            except Exception as e: self._log(f"!!! ERROR: {e}\n{traceback.format_exc()}")
+            finally: self.btn_single.config(state="normal"); self.btn_rating.config(state="normal")
+        threading.Thread(target=_target, daemon=True).start()
+
+    def _run_batch_dialog(self):
+        # Pass a pure dict config, not one containing Tk vars if possible, 
+        # but _cfg() already does that.
+        # Wait, in __init__ we did: self.base_cfg["VAR_CPU"] = var_cpu
+        # var_cpu is a tk.IntVar! That's the problem.
+        
+        # We need to separate the pure data config from the GUI control variables.
+        clean_cfg = self._cfg()
+        BatchDialog(self.root, clean_cfg, self.var_cpu_cores)
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support(); root = tk.Tk(); App(root); root.mainloop()
