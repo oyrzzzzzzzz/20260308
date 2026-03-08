@@ -1,0 +1,850 @@
+# -*- coding: utf-8 -*-
+"""
+SiC/IGBT Automated Double Pulse Test (DPT) & STCO Analysis Platform
+
+你提出的需求（本版实现）：
+1) 三轴图：分页保存 + 可选是否“弹窗显示”
+2) 趋势图：可选是否“弹窗显示”，也可单独控制是否生成/保存
+3) 时序定位优先：Ton/Tperiod/Tdelay/Ncycles；但如果 Tdelay 未识别到（NaN）或关键时序无效 -> Fallback Vgs阈值模式
+4) 不自动打开 raw（只用 RawRead 读取）
+5) 修复标点“画错轴导致对不上”（Vce点画在Vce轴，Ic点画在Ic轴）
+"""
+
+import os
+import re
+import sys
+import itertools
+import subprocess
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ===== PyLTSpice =====
+sys.path.append(r"c:\users\o00948823\appdata\roaming\python\python39\site-packages")
+from PyLTSpice import RawRead
+
+# ==========================================
+# 🎛️ 用户配置区（你要的开关都在这里）
+# ==========================================
+LTSPICE_EXE = r"D:\Users\o00948823\AppData\Local\Programs\ADI\LTspice\LTspice.exe"
+ASC_FILE = r"D:\SSDC-G2-DPT\SSDC-G2-segment\SSDCG2-test.asc"
+
+# 调试用：只跑第一组并用 -Run 打开
+DEBUG_GUI_RUN_ONE_CASE = False
+
+# 仿真超时
+SIM_TIMEOUT_SECONDS = 600
+RAW_MIN_BYTES = 1024
+
+# ✅ 三轴图显示/保存控制
+SHOW_TRIPLEAXIS_FIGS = True         # True：弹出三轴图（分页图会逐页 show）
+SAVE_TRIPLEAXIS_FIGS = True         # True：保存分页三轴图到 OUTPUT_DIR
+PULSES_PER_PAGE = 5                 # 每页显示几个脉冲（3或4比较好看）
+TRIPLEAXIS_DPI = 150                # 保存 DPI
+
+# ✅ 趋势图显示/保存控制
+GENERATE_TREND_PLOTS = True         # True：生成趋势图
+SHOW_TREND_PLOTS = True             # True：弹出趋势图窗口（会弹很多张，建议只在单组/小量时开）
+SAVE_TREND_PLOTS = True             # True：保存趋势图到 OUTPUT_DIR
+TREND_DPI = 150                     # 趋势图保存 DPI
+
+# ==========================================
+# 1. 参数映射
+# ==========================================
+USER_PARAM_MAP = {
+    'Vbus': 'Vbus', 'Ids': 'Ids', 'Vgon': 'Vgon', 'Vgoff': 'Vgoff',
+    'Ncycles': 'Ncycles', 'Tperiod': 'Tperiod', 'Ton': 'Ton',
+    'Tdelay': 'Tdelay', 'Rgon': 'Rgon', 'Rgoff': 'Rgoff', 'Tj': 'Tj'
+}
+
+# 2. 波形映射（按你的 .save）
+USER_WAVE_MAP = {
+    'vgs': 'V(VGS)',
+    'vce': 'V(mid)',
+    'ic':  'I(Ids)',
+    'pinst': 'V(P_inst)'
+}
+
+# ==========================================
+# 🎛️ 拉偏配置区
+# ==========================================
+SWEEP_CONFIG = {
+    'Vbus': [630],
+    'Rgon': [5]
+}
+
+OUTPUT_DIR = r"D:\DPT_Sweep_Results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ==========================================
+# 📊 二次分析绘图配置
+# ==========================================
+ANALYSIS_CONFIG = {
+    'x_axis': 'Vbus',
+    'legend': 'Rgon',
+    'pulses': ['P3', 'P2'],
+    'metrics': ['Eon(mJ)', 'Eoff(mJ)', 'dvdt_ON(max)', 'didt_ON(max)'],
+}
+
+UNIT_MAP = {
+    'Eon(mJ)': 'mJ', 'Eoff(mJ)': 'mJ',
+    'dvdt_ON(max)': 'V/ns', 'dvdt_OFF(max)': 'V/ns',
+    'didt_ON(max)': 'A/ns', 'didt_OFF(max)': 'A/ns',
+    'tr(ns)': 'ns', 'tf(ns)': 'ns'
+}
+
+# ==========================================
+# 🛠️ 工具函数
+# ==========================================
+def spice_to_float(val_str):
+    if isinstance(val_str, (int, float)):
+        return float(val_str)
+    val_str = str(val_str).strip().lower()
+    val_str = val_str.replace('µ', 'u').replace('μ', 'u')
+
+    multipliers = {
+        'f': 1e-15, 'p': 1e-12, 'n': 1e-9, 'u': 1e-6,
+        'm': 1e-3,  'k': 1e3,  'meg': 1e6, 'g': 1e9
+    }
+    m = re.match(r"^([-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)([a-zA-Z]*)$", val_str)
+    if not m:
+        return float('nan')
+
+    num = float(m.group(1))
+    suf = m.group(2)
+
+    # 兼容 ns/us/ms 写法
+    if suf.endswith('s') and suf not in multipliers:
+        suf = suf[:-1]
+
+    return num * multipliers.get(suf, 1.0)
+
+
+def mean_by_time(t_arr, y_arr, side='start', dur_s=50e-9):
+    if len(t_arr) == 0:
+        return float('nan')
+    t_arr = np.asarray(t_arr)
+    y_arr = np.asarray(y_arr)
+
+    if side == 'start':
+        m = t_arr <= (t_arr[0] + dur_s)
+        if not np.any(m):
+            return float(np.mean(y_arr[:max(1, min(10, len(y_arr)))]))
+        return float(np.mean(y_arr[m]))
+    else:
+        m = t_arr >= (t_arr[-1] - dur_s)
+        if not np.any(m):
+            return float(np.mean(y_arr[-max(1, min(10, len(y_arr))):]))
+        return float(np.mean(y_arr[m]))
+
+
+def swing_levels(t_arr, y_arr, dur_s=50e-9):
+    a = mean_by_time(t_arr, y_arr, 'start', dur_s)
+    b = mean_by_time(t_arr, y_arr, 'end', dur_s)
+    return (min(a, b), max(a, b))
+
+
+def calc_max_slope(time_arr, wave_arr, window_s=10e-9):
+    time_arr = np.asarray(time_arr)
+    wave_arr = np.asarray(wave_arr)
+    if len(time_arr) < 2:
+        return float('nan')
+    dt_avg = np.mean(np.diff(time_arr))
+    if dt_avg <= 0:
+        return float('nan')
+
+    pts = max(1, int(window_s / dt_avg))
+    if pts >= len(wave_arr):
+        return abs(wave_arr[-1] - wave_arr[0]) / (time_arr[-1] - time_arr[0]) * 1e-9
+
+    slopes = np.abs(wave_arr[pts:] - wave_arr[:-pts]) / (time_arr[pts:] - time_arr[:-pts])
+    return float(np.max(slopes) * 1e-9)  # /s -> /ns
+
+
+# ==========================================
+# ⚙️ 从 .net 读参数（最稳）
+# ==========================================
+def extract_netlist_params(net_file_path):
+    extracted = {k: float('nan') for k in USER_PARAM_MAP.keys()}
+    if not os.path.exists(net_file_path):
+        print(f"⚠️ 找不到网表文件: {net_file_path}")
+        return extracted
+
+    with open(net_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+
+    value_pat = r"(\{[^}]*\}|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?(?:[a-zA-Zµμ]+)?)"
+
+    for internal_name, spice_name in USER_PARAM_MAP.items():
+        m = re.findall(
+            rf"(?im)^\s*\.param\b.*\b{re.escape(spice_name)}\b\s*(?:=\s*|\s+){value_pat}",
+            content
+        )
+        if m:
+            extracted[internal_name] = spice_to_float(m[-1])
+
+    print(f"✅ 从 .net 提取参数: Ton={extracted.get('Ton')}, Tperiod={extracted.get('Tperiod')}, "
+          f"Tdelay={extracted.get('Tdelay')}, Ncycles={extracted.get('Ncycles')}")
+    return extracted
+
+
+# ==========================================
+# ⚙️ ASC 参数修改器（修复 \n 吞噬）
+# ==========================================
+def update_asc_params(template_path, target_path, param_updates):
+    with open(template_path, 'r', encoding='cp1252', errors='ignore') as f:
+        lines = f.readlines()
+
+    value_pattern = r"(\{[^}]*\}|[^\\\s]+)"  # 不跨过 \
+
+    new_lines = []
+    for line in lines:
+        if line.startswith('TEXT') and '.param' in line.lower():
+            for p_name, p_val in param_updates.items():
+                pat = re.compile(
+                    rf"(\b{re.escape(p_name)}\b\s*(?:=\s*|\s+)){value_pattern}",
+                    re.IGNORECASE
+                )
+                if pat.search(line):
+                    old_line = line.rstrip("\n")
+                    new_val = str(p_val).strip()
+                    line = pat.sub(lambda m: m.group(1) + new_val, line, count=1)
+
+                    print(f"      [参数微创手术] {p_name}:")
+                    print(f"         修改前 -> {old_line}")
+                    print(f"         修改后 -> {line.rstrip()}")
+
+        new_lines.append(line)
+
+    with open(target_path, 'w', encoding='cp1252') as f:
+        f.writelines(new_lines)
+
+
+# ==========================================
+# ⚙️ 仿真执行：-b + timeout + log/raw 判定
+# ==========================================
+ERROR_KEYS = (
+    "fatal error",
+    "trouble",
+    "singular matrix",
+    "timestep too small",
+    "error:"
+)
+
+def check_sim_ok(log_file, raw_file):
+    if not os.path.exists(log_file):
+        return False, "no log generated"
+
+    try:
+        with open(log_file, "r", encoding="mbcs", errors="ignore") as f:
+            txt = f.read().lower()
+        if any(k in txt for k in ERROR_KEYS):
+            return False, "log indicates error/non-convergence"
+    except Exception:
+        return False, "cannot read log"
+
+    if not os.path.exists(raw_file):
+        return False, "no raw generated"
+
+    try:
+        if os.path.getsize(raw_file) < RAW_MIN_BYTES:
+            return False, "raw too small (maybe incomplete)"
+    except Exception:
+        return False, "raw size check failed"
+
+    return True, "ok"
+
+
+def run_ltspice_batch(ltspice_exe, asc_path, workdir, timeout_s):
+    log_file = asc_path.replace('.asc', '.log')
+    raw_file = asc_path.replace('.asc', '.raw')
+
+    for p in [log_file, raw_file]:
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+    try:
+        subprocess.run(
+            [ltspice_exe, "-b", asc_path],
+            cwd=workdir,
+            timeout=timeout_s,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timeout>{timeout_s}s"
+
+    ok, reason = check_sim_ok(log_file, raw_file)
+    return ok, reason
+
+
+# ==========================================
+# 🧮 核心：DPT 处理与绘图（分页 + 正确标点轴）
+# ==========================================
+def process_and_plot_dpt(
+    LTR,
+    params,
+    show_plot=True,
+    save_dir=None,
+    run_id="run",
+    pulses_per_page=3,
+    save_pages=True,
+    page_dpi=150
+):
+    print("\n🧮 进入核心数据处理与绘图模块...")
+
+    EMPTY = (None, pd.DataFrame())
+
+    # ---- 读 time ----
+    try:
+        time_arr = LTR.get_trace('time').get_wave()
+    except Exception as e:
+        print(f"❌ 读取 time 失败: {e}")
+        return EMPTY
+
+    # ---- 读波形 ----
+    waves = {}
+    for key, name in USER_WAVE_MAP.items():
+        try:
+            waves[key] = LTR.get_trace(name).get_wave()
+        except Exception:
+            print(f"❌ 找不到波形 '{name}'，请检查 .save 语句！")
+            return EMPTY
+
+    vgs = waves['vgs']
+    vce = waves['vce']
+    ic = waves['ic']
+    pinst = waves['pinst']
+
+    # Vgs ylim（仅显示）
+    vgs_max_actual = float(np.max(vgs))
+    vgs_min_actual = float(np.min(vgs))
+    vgs_range = vgs_max_actual - vgs_min_actual
+    if not np.isfinite(vgs_range) or vgs_range == 0:
+        print("⚠️ Vgs range 异常，跳过")
+        return EMPTY
+    vgs_margin = vgs_range * 0.2
+    vgs_ylim = (vgs_min_actual - vgs_margin, vgs_max_actual + vgs_margin)
+
+    # =================================================
+    # 1) 脉冲识别：优先时序；若 Tdelay 没读到（NaN）则回退 Vgs Fallback（按你的要求）
+    # =================================================
+    Ton = params.get('Ton', np.nan)
+    Tperiod = params.get('Tperiod', np.nan)
+    Tdelay = params.get('Tdelay', np.nan)      # 没读到就是 NaN
+    Ncycles = params.get('Ncycles', np.nan)
+
+    use_timing = (np.isfinite(Ton) and np.isfinite(Tperiod) and np.isfinite(Tdelay)
+                  and Ton > 0 and Tperiod > 0)
+
+    print(f"[Timing Debug] Ton={Ton}, Tperiod={Tperiod}, Tdelay={Tdelay}, Ncycles={Ncycles}, use_timing={use_timing}")
+
+    turn_on_times, turn_off_times = [], []
+
+    if use_timing:
+        if np.isfinite(Ncycles) and Ncycles > 0:
+            nmax = int(round(Ncycles))
+        else:
+            nmax = int(np.floor((time_arr[-1] - Tdelay) / Tperiod)) + 1
+            nmax = max(0, nmax)
+
+        for k in range(nmax):
+            t_on = Tdelay + k * Tperiod
+            t_off = t_on + Ton
+            if t_on < time_arr[0]:
+                continue
+            if t_off > time_arr[-1]:
+                break
+            turn_on_times.append(float(t_on))
+            turn_off_times.append(float(t_off))
+
+        print(f"✅ 时序定位模式：识别到 {len(turn_on_times)} 个脉冲 (Ncycles={Ncycles})")
+
+    # ---- fallback ----
+    if len(turn_on_times) == 0:
+        v_th = vgs_min_actual + 0.5 * vgs_range
+        edges = np.diff((vgs > v_th).astype(int))
+        on_idx = np.where(edges == 1)[0]
+        off_idx = np.where(edges == -1)[0]
+        n = min(len(on_idx), len(off_idx))
+        if n == 0:
+            print("⚠️ 未找到有效边沿，返回空")
+            return EMPTY
+        turn_on_times = [float(time_arr[i]) for i in on_idx[:n]]
+        turn_off_times = [float(time_arr[i]) for i in off_idx[:n]]
+        print(f"⚠️ Fallback Vgs阈值模式：识别到 {n} 个脉冲")
+
+    valid_cycles = min(len(turn_on_times), len(turn_off_times))
+    if valid_cycles == 0:
+        return EMPTY
+
+    # =================================================
+    # 2) 分页绘图
+    # =================================================
+    PRE_S = 200e-9
+    POST_S = 800e-9
+    LEVEL_DUR_S = 50e-9
+
+    results_list = []
+    figs = []
+
+    n_pages = int(np.ceil(valid_cycles / max(1, pulses_per_page)))
+    if save_dir is not None and save_pages:
+        os.makedirs(save_dir, exist_ok=True)
+
+    for page in range(n_pages):
+        page_start = page * pulses_per_page
+        page_end = min((page + 1) * pulses_per_page, valid_cycles)
+        page_indices = list(range(page_start, page_end))
+        cols = len(page_indices)
+
+        fig = plt.figure(figsize=(18, 12))
+        param_str = " | ".join([f"{k}:{v}" for k, v in params.items()])
+        fig.suptitle(f"DPT Triple-Axis Report [{param_str}]  (Page {page+1}/{n_pages})",
+                     fontsize=18, fontweight='bold', y=0.98)
+        plt.subplots_adjust(left=0.08, right=0.82, wspace=0.7, hspace=0.4, top=0.9)
+
+        # ---------- Overview ----------
+        ax_main = plt.subplot(3, 1, 1)
+
+        ax_main.plot(time_arr * 1e6, vce, 'm-', alpha=0.8)
+        ax_main.set_ylabel("Vce (V)", color='m', fontweight='bold')
+        ax_main.tick_params(axis='y', labelcolor='m')
+
+        ax_ic_main = ax_main.twinx()
+        ax_ic_main.plot(time_arr * 1e6, ic, 'g-', alpha=0.8)
+        ax_ic_main.set_ylabel("Ic (A)", color='g', fontweight='bold')
+        ax_ic_main.tick_params(axis='y', labelcolor='g')
+
+        ax_vgs_main = ax_main.twinx()
+        ax_vgs_main.spines["right"].set_position(("axes", 1.15))
+        ax_vgs_main.plot(time_arr * 1e6, vgs, 'b-', alpha=0.8)
+        ax_vgs_main.set_ylabel("Vgs (V)", color='b', fontweight='bold')
+        ax_vgs_main.tick_params(axis='y', labelcolor='b')
+        ax_vgs_main.set_ylim(vgs_ylim)
+
+        ax_main.set_title("Double Pulse Test Overview", fontsize=14, fontweight='bold')
+        ax_main.grid(True, linestyle='--')
+
+        # ---------- Page pulses ----------
+        for j, i in enumerate(page_indices):
+            # ==========================
+            # 🟢 Turn-ON
+            # ==========================
+            ax_on = plt.subplot(3, cols, cols + j + 1)
+            t_center = turn_on_times[i]
+
+            mask = (time_arr >= t_center - PRE_S) & (time_arr <= t_center + POST_S)
+            t_win = time_arr[mask]
+            vgs_win = vgs[mask]
+            vce_win = vce[mask]
+            ic_win = ic[mask]
+            p_win = pinst[mask]
+
+            e_on_mJ = dvdt_avg = dvdt_max = didt_avg = didt_max = td_on = tr = np.nan
+            ic_peak = float(np.max(ic_win)) if len(ic_win) else np.nan
+
+            vgs_low, vgs_high = swing_levels(t_win, vgs_win, LEVEL_DUR_S)
+            if not np.isfinite(vgs_low) or not np.isfinite(vgs_high) or abs(vgs_high - vgs_low) < 1e-6:
+                vgs_low, vgs_high = vgs_min_actual, vgs_max_actual
+            vgs10 = vgs_low + 0.1 * (vgs_high - vgs_low)
+
+            vbus_local = mean_by_time(t_win, vce_win, 'start', LEVEL_DUR_S)
+            ic_plateau_on = mean_by_time(t_win, ic_win, 'end', LEVEL_DUR_S)
+
+            v10, v90 = vbus_local * 0.1, vbus_local * 0.9
+            i10, i90 = ic_plateau_on * 0.1, ic_plateau_on * 0.9
+
+            idx_vce_90 = idx_vce_10 = idx_ic_10 = idx_ic_90 = None
+
+            try:
+                idx_vgs_10 = np.where(vgs_win >= vgs10)[0][0]
+                idx_vce_90 = idx_vgs_10 + np.where(vce_win[idx_vgs_10:] <= v90)[0][0]
+                idx_vce_10 = idx_vgs_10 + np.where(vce_win[idx_vgs_10:] <= v10)[0][0]
+
+                idx_peak_after = idx_vgs_10 + int(np.argmax(ic_win[idx_vgs_10:])) if len(ic_win[idx_vgs_10:]) else idx_vgs_10
+                ic_rising = ic_win[idx_vgs_10: idx_peak_after + 1]
+                idx_ic_10 = idx_vgs_10 + np.where(ic_rising >= i10)[0][0]
+                idx_ic_90 = idx_vgs_10 + np.where(ic_rising >= i90)[0][0]
+
+                idx_start = min(idx_ic_10, idx_vce_10)
+                idx_end = max(idx_ic_10, idx_vce_10)
+                if idx_end > idx_start:
+                    e_on_mJ = np.trapz(p_win[idx_start:idx_end], t_win[idx_start:idx_end]) * 1000
+
+                td_on = (t_win[idx_ic_10] - t_win[idx_vgs_10]) * 1e9
+                tr = (t_win[idx_ic_90] - t_win[idx_ic_10]) * 1e9
+                if tr < 0:
+                    tr = np.nan
+
+                dt_vce = (t_win[idx_vce_10] - t_win[idx_vce_90]) * 1e9
+                didt_avg = abs(ic_plateau_on * 0.8 / tr) if np.isfinite(tr) and tr > 0 else np.nan
+                dvdt_avg = abs(vbus_local * 0.8 / dt_vce) if np.isfinite(dt_vce) and dt_vce > 0 else np.nan
+
+                i_s, i_e = min(idx_ic_10, idx_ic_90), max(idx_ic_10, idx_ic_90)
+                v_s, v_e = min(idx_vce_10, idx_vce_90), max(idx_vce_10, idx_vce_90)
+                didt_max = calc_max_slope(t_win[i_s:i_e + 1], ic_win[i_s:i_e + 1])
+                dvdt_max = calc_max_slope(t_win[v_s:v_e + 1], vce_win[v_s:v_e + 1])
+            except Exception:
+                pass
+
+            # 三轴
+            ax_on.plot(t_win * 1e6, vce_win, 'm-')
+            ax_on.set_ylabel("Vce (V)", color='m')
+            ax_on.tick_params(axis='y', labelcolor='m')
+
+            ax_ic_on = ax_on.twinx()
+            ax_ic_on.plot(t_win * 1e6, ic_win, 'g-')
+            ax_ic_on.set_ylabel("Ic (A)", color='g')
+            ax_ic_on.tick_params(axis='y', labelcolor='g')
+
+            ax_vgs_on = ax_on.twinx()
+            ax_vgs_on.spines["right"].set_position(("axes", 1.15))
+            ax_vgs_on.plot(t_win * 1e6, vgs_win, 'b-')
+            ax_vgs_on.set_ylabel("Vgs (V)", color='b')
+            ax_vgs_on.tick_params(axis='y', labelcolor='b')
+            ax_vgs_on.set_ylim(vgs_ylim)
+
+            # 标点：Vce 在 ax_on；Ic 在 ax_ic_on
+            if idx_vce_90 is not None and idx_vce_10 is not None:
+                ax_on.scatter([t_win[idx_vce_90] * 1e6, t_win[idx_vce_10] * 1e6],
+                              [vce_win[idx_vce_90], vce_win[idx_vce_10]],
+                              c='darkorange', zorder=5)
+            if idx_ic_10 is not None and idx_ic_90 is not None:
+                ax_ic_on.scatter([t_win[idx_ic_10] * 1e6, t_win[idx_ic_90] * 1e6],
+                                 [ic_win[idx_ic_10], ic_win[idx_ic_90]],
+                                 c='dodgerblue', zorder=5)
+
+            title_on = "Pulse 1 (Inductor Charging) - Turn ON" if i == 0 else f"Pulse {i + 1} - Hard Turn ON"
+            ax_on.set_title(title_on, fontweight='bold', fontsize=11)
+            ax_on.grid(True, linestyle=':')
+
+            text_info = (f"Iplateau: {ic_plateau_on:.1f} A | Ipeak: {ic_peak:.1f} A\n"
+                         f"Eon: {e_on_mJ:.2f} mJ\n"
+                         f"dv/dt (avg|max): {dvdt_avg:.1f} | {dvdt_max:.1f} V/ns\n"
+                         f"di/dt (avg|max): {didt_avg:.1f} | {didt_max:.1f} A/ns\n"
+                         f"td_on: {td_on:.1f} ns | tr: {tr:.1f} ns")
+            ax_on.text(0.02, 0.45, text_info, transform=ax_on.transAxes, fontsize=9,
+                       bbox=dict(facecolor='white', alpha=0.85))
+
+            # ==========================
+            # 🔴 Turn-OFF
+            # ==========================
+            ax_off = plt.subplot(3, cols, 2 * cols + j + 1)
+            t_center = turn_off_times[i]
+
+            mask = (time_arr >= t_center - PRE_S) & (time_arr <= t_center + POST_S)
+            t_win = time_arr[mask]
+            vgs_win = vgs[mask]
+            vce_win = vce[mask]
+            ic_win = ic[mask]
+            p_win = pinst[mask]
+
+            e_off_mJ = dvdt_avg_off = dvdt_max_off = didt_avg_off = didt_max_off = td_off = tf = np.nan
+            vce_peak = float(np.max(vce_win)) if len(vce_win) else np.nan
+
+            vgs_low, vgs_high = swing_levels(t_win, vgs_win, LEVEL_DUR_S)
+            if not np.isfinite(vgs_low) or not np.isfinite(vgs_high) or abs(vgs_high - vgs_low) < 1e-6:
+                vgs_low, vgs_high = vgs_min_actual, vgs_max_actual
+            vgs90 = vgs_low + 0.9 * (vgs_high - vgs_low)
+
+            ic_plateau_off = mean_by_time(t_win, ic_win, 'start', LEVEL_DUR_S)
+            vbus_local = mean_by_time(t_win, vce_win, 'end', LEVEL_DUR_S)
+
+            v10, v90 = vbus_local * 0.1, vbus_local * 0.9
+            i10, i90 = ic_plateau_off * 0.1, ic_plateau_off * 0.9
+
+            idx_vce_10 = idx_vce_90 = idx_ic_90 = idx_ic_10 = None
+
+            try:
+                idx_vgs_90 = np.where(vgs_win <= vgs90)[0][0]
+                idx_vce_10 = idx_vgs_90 + np.where(vce_win[idx_vgs_90:] >= v10)[0][0]
+                idx_vce_90 = idx_vgs_90 + np.where(vce_win[idx_vgs_90:] >= v90)[0][0]
+
+                idx_plate = int(np.argmax(ic_win)) if len(ic_win) else 0
+                base_idx = max(idx_plate, idx_vgs_90)
+                idx_ic_90 = base_idx + np.where(ic_win[base_idx:] <= i90)[0][0]
+                idx_ic_10 = base_idx + np.where(ic_win[base_idx:] <= i10)[0][0]
+
+                idx_start = min(idx_vce_10, idx_ic_10)
+                idx_end = max(idx_vce_10, idx_ic_10)
+                if idx_end > idx_start:
+                    e_off_mJ = np.trapz(p_win[idx_start:idx_end], t_win[idx_start:idx_end]) * 1000
+
+                td_off = (t_win[idx_vce_10] - t_win[idx_vgs_90]) * 1e9
+                tf = (t_win[idx_ic_10] - t_win[idx_ic_90]) * 1e9
+                if tf < 0:
+                    tf = np.nan
+
+                dt_vce = (t_win[idx_vce_90] - t_win[idx_vce_10]) * 1e9
+                didt_avg_off = abs(ic_plateau_off * 0.8 / tf) if np.isfinite(tf) and tf > 0 else np.nan
+                dvdt_avg_off = abs(vbus_local * 0.8 / dt_vce) if np.isfinite(dt_vce) and dt_vce > 0 else np.nan
+
+                i_s, i_e = min(idx_ic_10, idx_ic_90), max(idx_ic_10, idx_ic_90)
+                v_s, v_e = min(idx_vce_10, idx_vce_90), max(idx_vce_10, idx_vce_90)
+                didt_max_off = calc_max_slope(t_win[i_s:i_e + 1], ic_win[i_s:i_e + 1])
+                dvdt_max_off = calc_max_slope(t_win[v_s:v_e + 1], vce_win[v_s:v_e + 1])
+            except Exception:
+                pass
+
+            # 三轴
+            ax_off.plot(t_win * 1e6, vce_win, 'm-')
+            ax_off.set_ylabel("Vce (V)", color='m')
+            ax_off.tick_params(axis='y', labelcolor='m')
+
+            ax_ic_off = ax_off.twinx()
+            ax_ic_off.plot(t_win * 1e6, ic_win, 'g-')
+            ax_ic_off.set_ylabel("Ic (A)", color='g')
+            ax_ic_off.tick_params(axis='y', labelcolor='g')
+
+            ax_vgs_off = ax_off.twinx()
+            ax_vgs_off.spines["right"].set_position(("axes", 1.15))
+            ax_vgs_off.plot(t_win * 1e6, vgs_win, 'b-')
+            ax_vgs_off.set_ylabel("Vgs (V)", color='b')
+            ax_vgs_off.tick_params(axis='y', labelcolor='b')
+            ax_vgs_off.set_ylim(vgs_ylim)
+
+            # 标点：Vce 在 ax_off；Ic 在 ax_ic_off
+            if idx_vce_10 is not None and idx_vce_90 is not None:
+                ax_off.scatter([t_win[idx_vce_10] * 1e6, t_win[idx_vce_90] * 1e6],
+                               [vce_win[idx_vce_10], vce_win[idx_vce_90]],
+                               c='darkorange', zorder=5)
+            if idx_ic_90 is not None and idx_ic_10 is not None:
+                ax_ic_off.scatter([t_win[idx_ic_90] * 1e6, t_win[idx_ic_10] * 1e6],
+                                  [ic_win[idx_ic_90], ic_win[idx_ic_10]],
+                                  c='dodgerblue', zorder=5)
+
+            ax_off.set_title(f"Pulse {i + 1} - Turn OFF", fontweight='bold', fontsize=11)
+            ax_off.set_xlabel("Time (us)", fontweight='bold')
+            ax_off.grid(True, linestyle=':')
+
+            text_info_off = (f"Iplateau: {ic_plateau_off:.1f} A | Vpeak: {vce_peak:.1f} V\n"
+                             f"Eoff: {e_off_mJ:.2f} mJ\n"
+                             f"dv/dt (avg|max): {dvdt_avg_off:.1f} | {dvdt_max_off:.1f} V/ns\n"
+                             f"di/dt (avg|max): {didt_avg_off:.1f} | {didt_max_off:.1f} A/ns\n"
+                             f"td_off: {td_off:.1f} ns | tf: {tf:.1f} ns")
+            ax_off.text(0.02, 0.45, text_info_off, transform=ax_off.transAxes, fontsize=9,
+                        bbox=dict(facecolor='white', alpha=0.85))
+
+            results_list.append({
+                'Pulse_Phase': f"P{i + 1}",
+                'Eon(mJ)': round(e_on_mJ, 3) if np.isfinite(e_on_mJ) else np.nan,
+                'Eoff(mJ)': round(e_off_mJ, 3) if np.isfinite(e_off_mJ) else np.nan,
+                'Vce_peak(V)': round(vce_peak, 1) if np.isfinite(vce_peak) else np.nan,
+                'Ic_peak(A)': round(ic_peak, 1) if np.isfinite(ic_peak) else np.nan,
+                'tr(ns)': round(tr, 1) if np.isfinite(tr) else np.nan,
+                'tf(ns)': round(tf, 1) if np.isfinite(tf) else np.nan,
+                'dvdt_ON(max)': round(dvdt_max, 1) if np.isfinite(dvdt_max) else np.nan,
+                'dvdt_OFF(max)': round(dvdt_max_off, 1) if np.isfinite(dvdt_max_off) else np.nan,
+                'didt_ON(max)': round(didt_max, 1) if np.isfinite(didt_max) else np.nan,
+                'didt_OFF(max)': round(didt_max_off, 1) if np.isfinite(didt_max_off) else np.nan
+            })
+
+        # 保存本页
+        if save_dir is not None and save_pages:
+            page_path = os.path.join(save_dir, f"01_TripleAxis_{run_id}_page{page+1}.png")
+            fig.savefig(page_path, dpi=page_dpi, bbox_inches='tight')
+
+        if show_plot:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        figs.append(fig)
+
+    df = pd.DataFrame(results_list)
+    return (figs[0] if figs else None), df
+
+
+# ==========================================
+# 📈 趋势分析（按开关控制 show/save）
+# ==========================================
+def generate_sweep_analysis_plots(df, config, output_dir, show_plots=False, save_plots=True, dpi=150):
+    x_col = config['x_axis']
+    legend_col = config['legend']
+    pulses = config['pulses']
+    metrics = config['metrics']
+
+    analysis_dir = output_dir
+    os.makedirs(analysis_dir, exist_ok=True)
+
+    print(f"\n📈 正在生成趋势分析图表 (X轴: {x_col}, 图例: {legend_col})...")
+
+    for pulse in pulses:
+        pulse_data = df[df['Pulse_Phase'] == pulse]
+        if pulse_data.empty:
+            continue
+
+        for metric in metrics:
+            if metric not in pulse_data.columns:
+                continue
+
+            plt.figure(figsize=(10, 7))
+            try:
+                pivot_df = pulse_data.pivot_table(
+                    index=x_col,
+                    columns=legend_col,
+                    values=metric,
+                    aggfunc='mean'
+                ).sort_index()
+
+                pivot_df.plot(kind='line', marker='o', linewidth=2, markersize=8, ax=plt.gca())
+
+                unit = UNIT_MAP.get(metric, '')
+                plt.title(f"{pulse} Trend: {metric} vs {x_col}", fontsize=14, fontweight='bold')
+                plt.xlabel(f"{x_col}", fontsize=12)
+                plt.ylabel(f"{metric} ({unit})", fontsize=12)
+                plt.grid(True, linestyle='--', alpha=0.7)
+                plt.legend(title=legend_col, frameon=True)
+
+                clean_metric = metric.replace('(', '_').replace(')', '').replace('/', '')
+                file_name = f"02_Trend_{pulse}_{clean_metric}_vs_{x_col}.png"
+
+                if save_plots:
+                    plt.savefig(os.path.join(analysis_dir, file_name), dpi=dpi, bbox_inches='tight')
+                    print(f"   ✅ 已生成趋势图: {file_name}")
+
+                if show_plots:
+                    plt.show()
+                else:
+                    plt.close()
+            except Exception as e:
+                print(f"   ⚠️ 指标 {metric} 绘图跳过: {e}")
+                plt.close()
+
+    print("✨ 趋势分析完成。")
+
+
+# ==========================================
+# 🚀 主程序
+# ==========================================
+def main():
+    # ✅ 只有当你需要弹窗时才开交互更舒服
+    if SHOW_TRIPLEAXIS_FIGS or SHOW_TREND_PLOTS:
+        plt.ion()
+    else:
+        plt.ioff()
+
+    source_dir = os.path.dirname(ASC_FILE)
+    keys = list(SWEEP_CONFIG.keys())
+    combinations = list(itertools.product(*SWEEP_CONFIG.values()))
+    all_summary = []
+
+    print(f"🚀 开始全量拉偏实验 (共 {len(combinations)} 组)...")
+
+    for i, combo in enumerate(combinations):
+        current_params = dict(zip(keys, combo))
+        run_id = "_".join([f"{k}{v}" for k, v in current_params.items()])
+        print(f"\n▶️ [{i+1}/{len(combinations)}] 正在处理组合: {current_params}")
+
+        temp_asc = os.path.join(source_dir, f"__tmp_{run_id}.asc")
+        update_asc_params(ASC_FILE, temp_asc, current_params)
+
+        log_file = temp_asc.replace('.asc', '.log')
+        raw_file = temp_asc.replace('.asc', '.raw')
+
+        # 单组 GUI 调试
+        if DEBUG_GUI_RUN_ONE_CASE:
+            print("🧪 DEBUG_GUI_RUN_ONE_CASE=True：仅调试第一组，使用 -Run 打开 LTspice")
+            subprocess.Popen([LTSPICE_EXE, "-Run", temp_asc], cwd=source_dir)
+            print("👉 已打开 LTspice。需要继续 sweep 时把 DEBUG_GUI_RUN_ONE_CASE 设为 False。")
+            return
+
+        print(f"   ⏳ 正在调用 LTspice 仿真 (-b, timeout={SIM_TIMEOUT_SECONDS}s)...", end=' ', flush=True)
+        ok, reason = run_ltspice_batch(LTSPICE_EXE, temp_asc, source_dir, SIM_TIMEOUT_SECONDS)
+
+        if not ok:
+            print(f"\n   ❌ 仿真失败，跳过该组合: {current_params} | reason={reason}")
+            for f in [temp_asc, raw_file, log_file,
+                      temp_asc.replace('.asc', '.op.raw'),
+                      temp_asc.replace('.asc', '.net')]:
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+            continue
+
+        print("✅ 仿真完成")
+
+        # B. 数据提取与分页三轴图输出
+        net_file = temp_asc.replace('.asc', '.net')
+
+        fig, df_res = None, pd.DataFrame()
+
+        if os.path.exists(raw_file):
+            try:
+                LTR = RawRead(raw_file)
+                params_all = extract_netlist_params(net_file)
+                params_all.update(current_params)
+
+                fig, df_res = process_and_plot_dpt(
+                    LTR,
+                    params_all,
+                    show_plot=SHOW_TRIPLEAXIS_FIGS,
+                    save_dir=OUTPUT_DIR if SAVE_TRIPLEAXIS_FIGS else None,
+                    run_id=run_id,
+                    pulses_per_page=PULSES_PER_PAGE,
+                    save_pages=SAVE_TRIPLEAXIS_FIGS,
+                    page_dpi=TRIPLEAXIS_DPI
+                )
+            except Exception as e:
+                print(f"   ⚠️ RawRead/处理失败，跳过该组合: {current_params} | err={e}")
+
+        if fig is not None and not df_res.empty:
+            print(f"   📊 成功提取 {len(df_res)} 个开关周期的特征参数")
+            for k, v in current_params.items():
+                df_res[k] = v
+            all_summary.append(df_res)
+
+            # 如果你开了 show，matplotlib 窗口会弹；如果没开 show，这里不需要保存 fig
+            try:
+                plt.close(fig)
+            except Exception:
+                pass
+
+        # C. 清理临时文件
+        for f in [temp_asc, raw_file, log_file,
+                  temp_asc.replace('.asc', '.op.raw'),
+                  net_file]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
+    # 汇总输出 + 趋势图
+    if all_summary:
+        final_df = pd.concat(all_summary, ignore_index=True)
+        print("\n📈 ====== 最终拉偏特征提取总报告 ======")
+        print(final_df.to_string(index=False))
+        print("========================================\n")
+
+        excel_path = os.path.join(OUTPUT_DIR, "Sweep_Results_Table.xlsx")
+        final_df.to_excel(excel_path, index=False)
+        print(f"✅ Excel 特征数据表已导出: {excel_path}")
+
+        if GENERATE_TREND_PLOTS:
+            generate_sweep_analysis_plots(
+                final_df,
+                ANALYSIS_CONFIG,
+                OUTPUT_DIR,
+                show_plots=SHOW_TREND_PLOTS,
+                save_plots=SAVE_TREND_PLOTS,
+                dpi=TREND_DPI
+            )
+
+    # 结束时保持窗口（你想弹窗时）
+    if SHOW_TRIPLEAXIS_FIGS or SHOW_TREND_PLOTS:
+        plt.ioff()
+        plt.show()
+
+    print(f"\n🎉 任务完成！所有文件已存入: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
